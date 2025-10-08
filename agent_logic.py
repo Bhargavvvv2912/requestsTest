@@ -66,22 +66,75 @@ class DependencyAgent:
         return all('==' in line for line in lines), lines
 
     def _bootstrap_unpinned_requirements(self):
-        print("Unpinned requirements detected. Creating a stable baseline...")
-        venv_dir = Path("./bootstrap_venv");
+        start_group("BOOTSTRAP: Establishing a Stable Baseline")
+        print("Unpinned requirements detected. Creating and validating a stable baseline...")
+        venv_dir = Path("./bootstrap_venv")
         if venv_dir.exists(): shutil.rmtree(venv_dir)
         venv.create(venv_dir, with_pip=True)
-        python_executable = str(venv_dir / "bin" / "python")
-        _, stderr, returncode = run_command([python_executable, "-m", "pip", "install", "-r", str(self.requirements_path)])
-        if returncode != 0: sys.exit(f"CRITICAL ERROR: Failed to install initial set of dependencies. Error: {stderr}")
-        success, metrics, _ = validate_changes(python_executable, group_title="Running Validation on New Baseline")
-        if not success: sys.exit("CRITICAL ERROR: Initial dependencies failed validation.")
-        if metrics and "not available" not in metrics:
-            print(f"\n{'='*70}\n=== BOOTSTRAP SUCCESSFUL: METRICS FOR THE NEW BASELINE ===\n" + "\n".join([f"  {line}" for line in metrics.split('\n')]) + f"\n{'='*70}\n")
+        
+        # This function now uses the new, robust helper function
+        success, result, error_log = self._run_bootstrap_and_validate(venv_dir, self.requirements_path)
+        
+        if success:
+            print("\nInitial baseline is valid and stable!")
+            with open(self.requirements_path, "w") as f: f.write(result["packages"])
+            start_group("View new requirements.txt content"); print(result["packages"]); end_group()
+            if result["metrics"] and "not available" not in result["metrics"]:
+                print(f"\n{'='*70}\n=== BOOTSTRAP SUCCESSFUL: METRICS FOR THE NEW BASELINE ===\n" + "\n".join([f"  {line}" for line in result['metrics'].split('\n')]) + f"\n{'='*70}\n")
+                with open(self.config["METRICS_OUTPUT_FILE"], "w") as f: f.write(result["metrics"])
+            end_group()
+            return
+
+        # --- The rest of the new, resilient bootstrap logic follows ---
+        print("\nCRITICAL: Initial baseline failed validation. Initiating Bootstrap Healing Protocol.", file=sys.stderr)
+        start_group("View Initial Baseline Failure Log"); print(error_log); end_group()
+        
+        python_executable = str((venv_dir / "bin" / "python").resolve())
+        initial_failing_packages_list, _, _ = run_command([python_executable, "-m", "pip", "freeze"])
+        initial_failing_packages = self._prune_pip_freeze(initial_failing_packages_list).split('\n')
+
+        healed_packages_str = self._attempt_llm_bootstrap_heal(initial_failing_packages, error_log)
+        
+        if not healed_packages_str:
+            print("\nINFO: LLM healing failed. Falling back to Deterministic Downgrade Protocol.")
+            healed_packages_str = self._attempt_deterministic_bootstrap_heal(initial_failing_packages)
+
+        if healed_packages_str:
+            print("\nSUCCESS: Bootstrap Healing Protocol found a stable baseline.")
+            with open(self.requirements_path, "w") as f: f.write(healed_packages_str)
+            start_group("View Healed and Pinned requirements.txt"); print(healed_packages_str); end_group()
+        else:
+            sys.exit("CRITICAL ERROR: All bootstrap healing attempts failed. Cannot establish a stable baseline.")
+        end_group()
+    def _run_bootstrap_and_validate(self, venv_dir, requirements_source):
+        """
+        Installs a set of requirements into a venv and runs the validation script.
+        This is a core helper used by both the initial bootstrap and the healing protocols.
+        """
+        # THE FIX IS HERE: Use .resolve() to get an absolute path for robustness.
+        python_executable = str((venv_dir / "bin" / "python").resolve())
+        
+        # This function is smart: it can take a file path OR a list of packages.
+        if isinstance(requirements_source, (Path, str)):
+            pip_command = [python_executable, "-m", "pip", "install", "-r", str(requirements_source)]
+        else: # It's a list of packages, so we write a temporary file.
+            temp_reqs_path = venv_dir / "temp_reqs.txt"
+            with open(temp_reqs_path, "w") as f:
+                f.write("\n".join(requirements_source))
+            pip_command = [python_executable, "-m", "pip", "install", "-r", str(temp_reqs_path)]
+            
+        _, stderr_install, returncode = run_command(pip_command)
+        if returncode != 0:
+            return False, None, f"Failed to install dependencies. Error: {stderr_install}"
+
+        # Now, the absolute path is passed to validate_changes.
+        success, metrics, validation_output = validate_changes(python_executable, group_title="Running Validation on New Baseline")
+        if not success:
+            return False, None, validation_output
+            
         installed_packages, _, _ = run_command([python_executable, "-m", "pip", "freeze"])
-        with open(self.requirements_path, "w") as f: f.write(self._prune_pip_freeze(installed_packages))
-        start_group("View new requirements.txt content"); print(installed_packages); end_group()
-        if metrics:
-            with open(self.config["METRICS_OUTPUT_FILE"], "w") as f: f.write(metrics)
+        return True, {"metrics": metrics, "packages": self._prune_pip_freeze(installed_packages)}, None
+
 
     def run(self):
         if os.path.exists(self.config["METRICS_OUTPUT_FILE"]): os.remove(self.config["METRICS_OUTPUT_FILE"])
@@ -210,22 +263,48 @@ class DependencyAgent:
             return max(stable_versions, key=parse_version) if stable_versions else max([p.version for p in package_info.packages if p.version], key=parse_version)
         except Exception: return None
 
-    def _try_install_and_validate(self, package_to_update, new_version, dynamic_constraints, old_version, is_probe, changed_packages):
+    def _try_install_and_validate(self, package_to_update, new_version, dynamic_constraints, baseline_reqs_path, is_probe, changed_packages):
         venv_dir = Path("./temp_venv")
         if venv_dir.exists(): shutil.rmtree(venv_dir)
         venv.create(venv_dir, with_pip=True)
-        python_executable = str(venv_dir / "bin" / "python")
-        with open(self.requirements_path, "r") as f:
-             lines = [line.strip() for line in f if line.strip()]
+
+        # *** FIX #1: THE ABSOLUTE PATH FIX ***
+        # The path to the Python executable is now absolute, preventing the FileNotFoundError.
+        python_executable = str((venv_dir / "bin" / "python").resolve())
         
-        requirements_list = [f"{package_to_update}=={new_version}" if self._get_package_name_from_spec(l) == package_to_update else l for l in lines]
-        requirements_list.extend(dynamic_constraints)
+        temp_reqs_path = venv_dir / "temp_requirements.txt"
         
+        # *** FIX #2: THE TRANSACTIONAL PASS FIX ***
+        # It now reads from the consistent `baseline_reqs_path` for the pass,
+        # not the main requirements.txt which may have been changed.
+        with open(baseline_reqs_path, "r") as f_read, open(temp_reqs_path, "w") as f_write:
+            for line in f_read:
+                line = line.strip()
+                if not line or line.startswith('#'): continue
+                if self._get_package_name_from_spec(line) == package_to_update:
+                    f_write.write(f"{package_to_update}=={new_version}\n")
+                else:
+                    f_write.write(f"{line}\n")
+            for constraint in dynamic_constraints:
+                 if self._get_package_name_from_spec(constraint) != package_to_update:
+                    f_write.write(f"{constraint}\n")
+
+        # *** FIX #3: THE CONSISTENT PIP COMMAND FIX ***
+        # The install command now uses `pip install -r`, which is identical to the
+        # successful bootstrap method, preventing resolver inconsistencies.
+        pip_command = [python_executable, "-m", "pip", "install", "-r", str(temp_reqs_path)]
+        
+        old_version = "N/A"
+        with open(baseline_reqs_path, "r") as f:
+            for line in f:
+                if self._get_package_name_from_spec(line) == package_to_update:
+                    if '==' in line: old_version = line.strip().split('==')[1]
+
         if not is_probe:
             start_group(f"Attempting to install {package_to_update}=={new_version}")
             print(f"\nChange analysis: Updating '{package_to_update}' from {old_version} -> {new_version}")
-        
-        _, stderr_install, returncode = run_command([python_executable, "-m", "pip", "install"] + requirements_list)
+
+        _, stderr_install, returncode = run_command(pip_command)
         
         if not is_probe: end_group()
         
@@ -233,10 +312,9 @@ class DependencyAgent:
             llm_summary = self._ask_llm_to_summarize_error(stderr_install)
             reason = f"Installation conflict. Summary: {llm_summary}"
             return False, reason, stderr_install
-        
-        is_upgrade = new_version != old_version
-        if not is_upgrade and not changed_packages:
-             print("\n--> STEP 2: SKIPPING validation because no effective change has occurred.")
+
+        if new_version == old_version and not changed_packages:
+             print("\n--> SKIPPING validation because no effective version change has occurred.")
              return True, "Validation skipped (no change)", ""
 
         group_title = f"Validation for {package_to_update}=={new_version}"
