@@ -138,10 +138,13 @@ class DependencyAgent:
 
     def run(self):
         if os.path.exists(self.config["METRICS_OUTPUT_FILE"]): os.remove(self.config["METRICS_OUTPUT_FILE"])
+        
         is_pinned, _ = self._get_requirements_state()
         if not is_pinned:
             self._bootstrap_unpinned_requirements()
-            return
+            is_pinned, _ = self._get_requirements_state()
+            if not is_pinned:
+                 sys.exit("CRITICAL: Bootstrap process failed to produce a fully pinned requirements file.")
 
         dynamic_constraints = []
         final_successful_updates = {}
@@ -152,14 +155,24 @@ class DependencyAgent:
             pass_num += 1
             start_group(f"UPDATE PASS {pass_num}/{self.config['MAX_RUN_PASSES']} (Constraints: {dynamic_constraints})")
             
+            # *** THE FIX IS HERE (PART 1): Create the baseline file for this pass. ***
+            # This creates a safe copy of the requirements at the start of the pass.
+            pass_baseline_reqs_path = Path(f"./pass_{pass_num}_baseline_reqs.txt")
+            shutil.copy(self.requirements_path, pass_baseline_reqs_path)
+            
             changed_packages_this_pass = set()
             
-            _, lines = self._get_requirements_state()
+            with open(pass_baseline_reqs_path, 'r') as f:
+                lines = [line.strip() for line in f if line.strip()]
+            
             all_reqs = list(set(lines + dynamic_constraints))
             original_requirements = {self._get_package_name_from_spec(line): line for line in all_reqs}
             
             packages_to_update = []
             for package, spec in original_requirements.items():
+                if package in self.exclusions_from_this_run and pass_num == 1:
+                    print(f"  Skipping '{package}' in this run's update plan due to recent bootstrap healing.")
+                    continue
                 if '==' not in spec: continue
                 current_version = spec.split('==')[1]
                 latest_version = self.get_latest_version(package)
@@ -167,27 +180,40 @@ class DependencyAgent:
                     packages_to_update.append((package, current_version, latest_version))
             
             if not packages_to_update:
-                if pass_num == 1: print("\nAll dependencies are up-to-date.")
+                if pass_num == 1 and not self.exclusions_from_this_run: print("\nAll dependencies are up-to-date.")
                 else: print("\nNo further updates possible. System has converged.")
                 end_group()
+                if pass_baseline_reqs_path.exists(): pass_baseline_reqs_path.unlink() # Cleanup
                 break
             
             packages_to_update.sort(key=lambda p: self._calculate_update_risk(p[0], p[1], p[2]), reverse=True)
             print("\nPrioritized Update Plan for this Pass:")
             total_updates_in_plan = len(packages_to_update)
-            for i, (pkg, _, target_ver) in enumerate(packages_to_update):
-                score = self._calculate_update_risk(pkg, _, target_ver)
+            for i, (pkg, cur_ver, target_ver) in enumerate(packages_to_update):
+                score = self._calculate_update_risk(pkg, cur_ver, target_ver)
                 print(f"  {i+1}/{total_updates_in_plan}: {pkg} (Risk Score: {score:.2f}) -> {target_ver}")
 
-            learned_a_new_constraint = False
+            pass_successful_updates = {}
+
             for i, (package, current_ver, target_ver) in enumerate(packages_to_update):
                 print(f"\n" + "-"*80); print(f"PULSE: [PASS {pass_num} | ATTEMPT {i+1}/{total_updates_in_plan}] Processing '{package}'"); print(f"PULSE: Changed packages this pass so far: {changed_packages_this_pass}"); print("-"*80)
                 is_primary = self._get_package_name_from_spec(package) in self.primary_packages
-                success, reason, learned_constraint = self.attempt_update_with_healing(package, current_ver, target_ver, is_primary, dynamic_constraints, changed_packages_this_pass)
+                
+                # *** THE FIX IS HERE (PART 2): Call the healing function with all correct arguments. ***
+                success, reason, learned_constraint = self.attempt_update_with_healing(
+                    package=package, 
+                    current_version=current_ver, 
+                    target_version=target_ver, 
+                    is_primary=is_primary, 
+                    dynamic_constraints=dynamic_constraints, 
+                    baseline_reqs_path=pass_baseline_reqs_path,
+                    changed_packages_this_pass=changed_packages_this_pass
+                )
                 
                 if success:
                     final_successful_updates[package] = (target_ver, reason)
                     if package in final_failed_updates: del final_failed_updates[package]
+                    pass_successful_updates[package] = reason
                     if current_ver != reason:
                         changed_packages_this_pass.add(package)
                 else:
@@ -195,14 +221,17 @@ class DependencyAgent:
                     if learned_constraint and learned_constraint not in dynamic_constraints:
                         print(f"DIAGNOSIS: Learned new global constraint '{learned_constraint}' from failure of {package}.")
                         dynamic_constraints.append(learned_constraint)
-                        learned_a_new_constraint = True
-                        break
+            
+            if changed_packages_this_pass:
+                # Use the new helper to apply all changes at once
+                self._apply_pass_updates(pass_successful_updates, pass_baseline_reqs_path)
+
+            # *** THE FIX IS HERE (PART 3): Clean up the temporary baseline file. ***
+            if pass_baseline_reqs_path.exists():
+                pass_baseline_reqs_path.unlink()
             
             end_group()
-            if learned_a_new_constraint:
-                print("ACTION: Restarting update pass to apply newly learned global constraint.")
-                continue
-            
+
             if not changed_packages_this_pass:
                 print("\nNo effective version changes were made in this pass. System is stable.")
                 break
@@ -210,6 +239,40 @@ class DependencyAgent:
         self._print_final_summary(final_successful_updates, final_failed_updates)
         if final_successful_updates:
             self._run_final_health_check()
+            
+    def _apply_pass_updates(self, successful_updates, baseline_reqs_path):
+        """
+        Takes the successful updates from a pass and creates a new, frozen requirements.txt.
+        This is the commit part of the transactional update logic.
+        """
+        print("\nApplying successful changes from this pass...")
+        venv_dir = Path("./temp_venv")
+        if venv_dir.exists(): shutil.rmtree(venv_dir)
+        venv.create(venv_dir, with_pip=True)
+        python_executable = str((venv_dir / "bin" / "python").resolve())
+        
+        with open(baseline_reqs_path, "r") as f_read:
+            lines = [line.strip() for line in f_read if line.strip()]
+
+        for package, new_version in successful_updates.items():
+             lines = [f"{package}=={new_version}" if self._get_package_name_from_spec(l) == package else l for l in lines]
+        
+        temp_reqs_path = venv_dir / "final_pass_reqs.txt"
+        with open(temp_reqs_path, "w") as f_write:
+            f_write.write("\n".join(lines))
+        
+        # Install the full updated set and freeze it to capture any new transitive dependencies correctly
+        _, stderr, returncode = run_command([python_executable, "-m", "pip", "install", "-r", str(temp_reqs_path)])
+        if returncode != 0:
+            print(f"CRITICAL: Failed to install combined updates at end of pass. Error: {stderr}", file=sys.stderr)
+            # If the final combination fails, we revert to the baseline from the start of the pass for safety.
+            shutil.copy(baseline_reqs_path, self.requirements_path)
+            return
+
+        final_packages, _, _ = run_command([python_executable, "-m", "pip", "freeze"])
+        with open(self.requirements_path, "w") as f:
+            f.write(self._prune_pip_freeze(final_packages))
+        print("Successfully applied and froze all successful updates for this pass.")
 
     def _calculate_update_risk(self, package, current_ver, target_ver):
         usage = self.usage_scores.get(package, 0)
