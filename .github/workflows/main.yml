@@ -66,8 +66,6 @@ jobs:
           git add $TARGET_FILE
           
           git commit -m "chore(deps): Autonomously update requests dependencies [skip ci]" -m "$COMMIT_BODY"
-          
-          rm -f metrics_output.txt
 
           git push
 
