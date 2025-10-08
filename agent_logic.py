@@ -23,6 +23,9 @@ class DependencyAgent:
         self.llm_available = True
         self.usage_scores = self._calculate_risk_scores()
 
+        # *** THE FIX IS HERE: Initialize the missing attribute. ***
+        self.exclusions_from_this_run = set()
+
     def _calculate_risk_scores(self):
         start_group("Analyzing Codebase for Update Risk")
         scores = {}
