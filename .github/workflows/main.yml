@@ -25,13 +25,6 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Cache pip packages
-        uses: actions/cache@v3
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('requests/requirements-dev.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
 
       - name: Install agent dependencies
         run: pip install google-generativeai pypi-simple packaging
