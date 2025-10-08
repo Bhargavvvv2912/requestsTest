@@ -49,7 +49,7 @@ jobs:
           git config --global user.name 'AURA Dependency Agent'
           git config --global user.email 'aura-agent@users.noreply.github.com'
           
-          TARGET_FILE="requests/requirements-dev.txt"
+          TARGET_FILE="requirements-dev.txt"
           
           if git diff --quiet $TARGET_FILE; then
             echo "No dependency changes to commit."
