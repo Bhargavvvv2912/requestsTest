@@ -1,0 +1,103 @@
+name: Autonomous Dependency Updater for Requests
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 */3 * *'
+
+jobs:
+  update-dependencies:
+    runs-on: ubuntu-latest
+    
+    defaults:
+      run:
+        working-directory: ${{ github.workspace }}
+
+    steps:
+      - name: Checkout Experiment Repository
+        uses: actions/checkout@v4
+
+      - name: Clone Requests Repository
+        run: git clone https://github.com/psf/requests.git
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache pip packages
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requests/requirements-dev.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install agent dependencies
+        run: pip install google-generativeai pypi-simple packaging
+
+      - name: Update Google AI Library
+        run: pip install --upgrade google-generativeai
+
+      - name: Run the Autonomous Agent
+        run: python dependency_agent.py
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      
+      - name: Commit and push changes if any
+        run: |
+          git config --global user.name 'AURA Dependency Agent'
+          git config --global user.email 'aura-agent@users.noreply.github.com'
+          
+          TARGET_FILE="requests/requirements-dev.txt"
+          
+          if git diff --quiet $TARGET_FILE; then
+            echo "No dependency changes to commit."
+            exit 0
+          fi
+          
+          echo "Dependencies updated for Requests. Committing changes."
+          
+          COMMIT_BODY="Automated dependency updates for the Requests library."
+          if [ -f metrics_output.txt ]; then
+            COMMIT_BODY=$(cat metrics_output.txt)
+          fi
+          
+          git add $TARGET_FILE
+          
+          git commit -m "chore(deps): Autonomously update requests dependencies [skip ci]" -m "$COMMIT_BODY"
+          
+          rm -f metrics_output.txt
+
+          git push
+
+  validate-on-other-versions:
+    # This job is the final health check, running after a commit is made.
+    needs: update-dependencies
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ github.workspace }}
+    strategy:
+      matrix:
+        # Requests supports a wide range of versions. Let's test a modern set.
+        python-version: ['3.10', '3.11', '3.12']
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Clone Requests Repository
+        run: git clone https://github.com/psf/requests.git
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install updated dependencies
+        run: pip install -r requests/requirements-dev.txt
+
+      - name: Run validation (pytest) on Python ${{ matrix.python-version }}
+        # This is the final health check, running the library's own comprehensive test suite.
+        run: python -m pytest requests/tests
