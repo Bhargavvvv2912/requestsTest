@@ -323,12 +323,22 @@ class DependencyAgent:
             return False, "Validation script failed", validation_output
         return True, metrics, ""
 
-    def attempt_update_with_healing(self, package, current_version, target_version, is_primary, dynamic_constraints, changed_packages_this_pass):
+    def attempt_update_with_healing(self, package, current_version, target_version, is_primary, dynamic_constraints, baseline_reqs_path, changed_packages_this_pass):
         package_label = "(Primary)" if is_primary else "(Transient)"
-        success, result_data, stderr = self._try_install_and_validate(package, target_version, dynamic_constraints, old_version=current_version, is_probe=False, changed_packages=changed_packages_this_pass)
+        
+        # This is the function call that was causing the error. It is now fixed.
+        success, result_data, stderr = self._try_install_and_validate(
+            package_to_update=package, 
+            new_version=target_version, 
+            dynamic_constraints=dynamic_constraints, 
+            baseline_reqs_path=baseline_reqs_path, 
+            is_probe=False, 
+            changed_packages=changed_packages_this_pass
+        )
         
         if success:
-            self._handle_success(package, target_version, result_data, package_label)
+            # We don't need to call _handle_success here anymore.
+            # We just return the version that was successful.
             return True, target_version, None
 
         print(f"\nINFO: Initial update for '{package}' failed. Reason: '{result_data}'")
@@ -343,18 +353,31 @@ class DependencyAgent:
         version_candidates = self._ask_llm_for_version_candidates(package, target_version)
         if version_candidates:
             for candidate in version_candidates:
-                if parse_version(candidate) < parse_version(current_version): continue
+                if parse_version(candidate) <= parse_version(current_version): continue
                 print(f"INFO: Attempting LLM-suggested backtrack for {package} to {candidate}")
-                success, result_data, _ = self._try_install_and_validate(package, candidate, dynamic_constraints, old_version=current_version, is_probe=False, changed_packages=changed_packages_this_pass)
+                # And here...
+                success, _, _ = self._try_install_and_validate(
+                    package_to_update=package, 
+                    new_version=candidate, 
+                    dynamic_constraints=dynamic_constraints, 
+                    baseline_reqs_path=baseline_reqs_path,
+                    is_probe=False, # This is a full validation attempt
+                    changed_packages=changed_packages_this_pass
+                )
                 if success:
-                    self._handle_success(package, candidate, result_data, package_label)
                     return True, candidate, None
 
-        print(f"INFO: LLM suggestions failed. Falling back to Classic Binary Search.")
-        success_package = self._binary_search_backtrack(package, current_version, target_version, dynamic_constraints, changed_packages_this_pass)
-        if success_package:
-            found_version = success_package["version"]
-            self._handle_success(package, found_version, success_package["metrics"], package_label, installed_packages=success_package["installed_packages"])
+        print(f"INFO: LLM suggestions failed. Falling back to Binary Search backtracking.")
+        # And here...
+        found_version = self._binary_search_backtrack(
+            package=package, 
+            last_good_version=current_version, 
+            failed_version=target_version, 
+            dynamic_constraints=dynamic_constraints, 
+            baseline_reqs_path=baseline_reqs_path, 
+            changed_packages=changed_packages_this_pass
+        )
+        if found_version:
             return True, found_version, None
 
         return False, "All backtracking attempts failed.", None
@@ -372,44 +395,44 @@ class DependencyAgent:
             installed_packages, _, _ = run_command([python_executable_in_venv, "-m", "pip", "freeze"])
         with open(self.requirements_path, "w") as f: f.write(self._prune_pip_freeze(installed_packages))
 
-    def _binary_search_backtrack(self, package, last_good_version, failed_version, dynamic_constraints, changed_packages):
+    def _binary_search_backtrack(self, package, last_good_version, failed_version, dynamic_constraints, baseline_reqs_path, changed_packages):
         start_group(f"Binary Search Backtrack for {package}")
         
         versions = self.get_all_versions_between(package, last_good_version, failed_version)
-        if not versions:
-            print(f"Binary Search: No candidate versions found between {last_good_version} and {failed_version}.")
-            # Fallback to check if the last good version is still valid
-            success, metrics, _ = self._try_install_and_validate(package, last_good_version, dynamic_constraints, is_probe=True, changed_packages=changed_packages, old_version=last_good_version)
-            if success:
-                print(f"Binary Search SUCCESS: Re-validated last good version {last_good_version} as the only stable option.")
-                end_group()
-                python_executable_in_venv = str(Path("./temp_venv/bin/python"))
-                installed_packages, _, _ = run_command([python_executable_in_venv, "-m", "pip", "freeze"])
-                return {"version": last_good_version, "metrics": metrics, "installed_packages": installed_packages}
+        # Always add the last good version as a final fallback candidate
+        # to ensure we can at least return to the original state.
+        if last_good_version not in versions:
+            versions.insert(0, last_good_version)
+        
+        best_working_version = None
 
-        low, high = 0, len(versions) - 1
-        best_working_result = None
-        while low <= high:
-            mid = (low + high) // 2
-            test_version = versions[mid]
+        # Iterate backwards from the newest candidate version to the oldest
+        for test_version in reversed(versions):
             print(f"Binary Search: Probing version {test_version}...")
             
-            success, metrics_or_reason, _ = self._try_install_and_validate(package, test_version, dynamic_constraints, is_probe=True, changed_packages=changed_packages, old_version=last_good_version)
+            # And here...
+            success, _, _ = self._try_install_and_validate(
+                package_to_update=package, 
+                new_version=test_version, 
+                dynamic_constraints=dynamic_constraints, 
+                baseline_reqs_path=baseline_reqs_path,
+                is_probe=True, # This is just a probe
+                changed_packages=changed_packages
+            )
             
             if success:
                 print(f"Binary Search: Version {test_version} PASSED probe.")
-                python_executable_in_venv = str(Path("./temp_venv/bin/python"))
-                installed_packages, _, _ = run_command([python_executable_in_venv, "-m", "pip", "freeze"])
-                best_working_result = {"version": test_version, "metrics": metrics_or_reason, "installed_packages": installed_packages}
-                low = mid + 1
+                best_working_version = test_version
+                # Since we are iterating from newest to oldest, the first success is the best one.
+                break 
             else:
-                print(f"Binary Search: Version {test_version} FAILED probe. Reason: {metrics_or_reason}.")
-                high = mid - 1
+                print(f"Binary Search: Version {test_version} FAILED probe.")
         
         end_group()
-        if best_working_result:
-            print(f"Binary Search SUCCESS: Found latest stable version: {best_working_result['version']}")
-            return best_working_result
+        if best_working_version:
+            print(f"Binary Search SUCCESS: Found latest stable version: {best_working_version}")
+            return best_working_version
+            
         print(f"Binary Search FAILED: No stable version was found for {package}.")
         return None
 
