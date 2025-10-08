@@ -7,5 +7,4 @@ trustme
 wheel
 google.generativeai
 pypi_simple
-google.api_core.exceptions 
 packaging
