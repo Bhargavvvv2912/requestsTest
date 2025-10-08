@@ -307,11 +307,18 @@ class DependencyAgent:
         venv_dir = Path("./final_venv")
         if venv_dir.exists(): shutil.rmtree(venv_dir)
         venv.create(venv_dir, with_pip=True)
-        python_executable = str(venv_dir / "bin" / "python")
+        
+        # *** THE FIX IS HERE: Use .resolve() to get the absolute path. ***
+        python_executable = str((venv_dir / "bin" / "python").resolve())
+
+        # First, install the dependencies using the final requirements file.
         _, stderr, returncode = run_command([python_executable, "-m", "pip", "install", "-r", str(self.requirements_path)])
         if returncode != 0:
             print("CRITICAL ERROR: Final installation of combined dependencies failed!", file=sys.stderr); return
+
+        # Then, run the validation using the newly created environment.
         success, metrics, _ = validate_changes(python_executable, group_title="Final System Health Check")
+        
         if success and metrics and "not available" not in metrics:
             print("\n" + "="*70); print("=== FINAL METRICS FOR THE FULLY UPDATED ENVIRONMENT ===")
             indented_metrics = "\n".join([f"  {line}" for line in metrics.split('\n')])
@@ -333,32 +340,25 @@ class DependencyAgent:
         venv_dir = Path("./temp_venv")
         if venv_dir.exists(): shutil.rmtree(venv_dir)
         venv.create(venv_dir, with_pip=True)
-
-        # *** FIX #1: THE ABSOLUTE PATH FIX ***
-        # The path to the Python executable is now absolute, preventing the FileNotFoundError.
         python_executable = str((venv_dir / "bin" / "python").resolve())
         
         temp_reqs_path = venv_dir / "temp_requirements.txt"
         
-        # *** FIX #2: THE TRANSACTIONAL PASS FIX ***
-        # It now reads from the consistent `baseline_reqs_path` for the pass,
-        # not the main requirements.txt which may have been changed.
         with open(baseline_reqs_path, "r") as f_read, open(temp_reqs_path, "w") as f_write:
+            lines_for_file = []
             for line in f_read:
                 line = line.strip()
                 if not line or line.startswith('#'): continue
                 if self._get_package_name_from_spec(line) == package_to_update:
-                    f_write.write(f"{package_to_update}=={new_version}\n")
+                    lines_for_file.append(f"{package_to_update}=={new_version}")
                 else:
-                    f_write.write(f"{line}\n")
+                    lines_for_file.append(line)
             for constraint in dynamic_constraints:
                  if self._get_package_name_from_spec(constraint) != package_to_update:
-                    f_write.write(f"{constraint}\n")
+                    lines_for_file.append(constraint)
+            f_write.write("\n".join(lines_for_file))
 
-        # *** FIX #3: THE CONSISTENT PIP COMMAND FIX ***
-        # The install command now uses `pip install -r`, which is identical to the
-        # successful bootstrap method, preventing resolver inconsistencies.
-        pip_command = [python_executable, "-m", "pip", "install", "-r", str(temp_reqs_path)]
+        pip_command_robust = [python_executable, "-m", "pip", "install", "-r", str(temp_reqs_path)]
         
         old_version = "N/A"
         with open(baseline_reqs_path, "r") as f:
@@ -370,17 +370,38 @@ class DependencyAgent:
             start_group(f"Attempting to install {package_to_update}=={new_version}")
             print(f"\nChange analysis: Updating '{package_to_update}' from {old_version} -> {new_version}")
 
-        _, stderr_install, returncode = run_command(pip_command)
+        _, stderr_install, returncode = run_command(pip_command_robust)
         
         if not is_probe: end_group()
         
         if returncode != 0:
-            llm_summary = self._ask_llm_to_summarize_error(stderr_install)
-            reason = f"Installation conflict. Summary: {llm_summary}"
+            print("INFO: Main installation failed. Retrying with verbose logging to identify conflicting packages...")
+            
+            with open(temp_reqs_path, 'r') as f:
+                requirements_list_for_log = [line.strip() for line in f if line.strip()]
+
+            pip_command_for_logs = [python_executable, "-m", "pip", "install"] + requirements_list_for_log
+            _, stderr_for_logs, _ = run_command(pip_command_for_logs)
+
+            # *** THE FIX IS HERE: A much more robust regex to capture the conflicting packages. ***
+            conflict_match = re.search(r"Cannot install(?P<packages>[\s\S]+?)because", stderr_for_logs)
+            
+            reason = ""
+            if conflict_match:
+                # Clean up the captured package list for a clean log
+                conflicting_packages = ' '.join(conflict_match.group('packages').split())
+                conflicting_packages = conflicting_packages.replace(' and ', ', ').replace(',', ', ')
+                reason = f"Conflict between packages: {conflicting_packages}"
+                print(f"DIAGNOSIS: {reason}")
+            else:
+                # This is the fallback if the regex still fails for some reason
+                llm_summary = self._ask_llm_to_summarize_error(stderr_install)
+                reason = f"Installation conflict. Summary: {llm_summary}"
+            
             return False, reason, stderr_install
 
         if new_version == old_version and not changed_packages:
-             print("\n--> SKIPPING validation because no effective version change has occurred.")
+             # This message will now be correctly logged by the binary search function
              return True, "Validation skipped (no change)", ""
 
         group_title = f"Validation for {package_to_update}=={new_version}"
@@ -465,34 +486,32 @@ class DependencyAgent:
         start_group(f"Binary Search Backtrack for {package}")
         
         versions = self.get_all_versions_between(package, last_good_version, failed_version)
-        # Always add the last good version as a final fallback candidate
-        # to ensure we can at least return to the original state.
         if last_good_version not in versions:
             versions.insert(0, last_good_version)
         
         best_working_version = None
 
-        # Iterate backwards from the newest candidate version to the oldest
         for test_version in reversed(versions):
             print(f"Binary Search: Probing version {test_version}...")
             
-            # And here...
-            success, _, _ = self._try_install_and_validate(
+            success, reason_or_metrics, _ = self._try_install_and_validate(
                 package_to_update=package, 
                 new_version=test_version, 
                 dynamic_constraints=dynamic_constraints, 
                 baseline_reqs_path=baseline_reqs_path,
-                is_probe=True, # This is just a probe
+                is_probe=True,
                 changed_packages=changed_packages
             )
             
             if success:
+                # *** THE FIX IS HERE: It now prints the specific reason for the successful probe. ***
+                if "skipped" in str(reason_or_metrics):
+                    print(f"  --> {reason_or_metrics}")
                 print(f"Binary Search: Version {test_version} PASSED probe.")
                 best_working_version = test_version
-                # Since we are iterating from newest to oldest, the first success is the best one.
                 break 
             else:
-                print(f"Binary Search: Version {test_version} FAILED probe.")
+                print(f"Binary Search: Version {test_version} FAILED probe. Reason: {reason_or_metrics}")
         
         end_group()
         if best_working_version:
@@ -501,7 +520,7 @@ class DependencyAgent:
             
         print(f"Binary Search FAILED: No stable version was found for {package}.")
         return None
-
+    
     def get_all_versions_between(self, package_name, start_ver_str, end_ver_str):
         try:
             package_info = self.pypi.get_project_page(package_name)
