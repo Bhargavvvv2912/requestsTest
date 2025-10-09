@@ -49,25 +49,30 @@ jobs:
           git config --global user.name 'AURA Dependency Agent'
           git config --global user.email 'aura-agent@users.noreply.github.com'
           
-          TARGET_FILE="requirements-dev.txt"
+          TARGET_FILE="requests/requirements-dev.txt"
           
-          if git diff --quiet $TARGET_FILE; then
+          # *** THE FIX IS HERE: The "if !" inverts the logic. ***
+          # This now correctly means: "If there IS a difference..."
+          if ! git diff --quiet $TARGET_FILE; then
+            echo "Dependencies have changed. Committing and pushing..."
+            
+            COMMIT_BODY="Automated dependency updates for the Requests library."
+            if [ -f metrics_output.txt ]; then
+              COMMIT_BODY=$(cat metrics_output.txt)
+            fi
+            
+            git add $TARGET_FILE
+            
+            git commit -m "chore(deps): Autonomously manage requests dependencies [skip ci]" -m "$COMMIT_BODY"
+            
+            # Now we can safely clean up the metrics file
+            rm -f metrics_output.txt
+            
+            git push
+          else
             echo "No dependency changes to commit."
             exit 0
           fi
-          
-          echo "Dependencies updated for Requests. Committing changes."
-          
-          COMMIT_BODY="Automated dependency updates for the Requests library."
-          if [ -f metrics_output.txt ]; then
-            COMMIT_BODY=$(cat metrics_output.txt)
-          fi
-          
-          git add $TARGET_FILE
-          
-          git commit -m "chore(deps): Autonomously update requests dependencies [skip ci]" -m "$COMMIT_BODY"
-
-          git push
 
   validate-on-other-versions:
     # This job is the final health check, running after a commit is made.
