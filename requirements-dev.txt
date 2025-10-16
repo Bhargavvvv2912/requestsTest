@@ -6,10 +6,10 @@ brotlicffi==1.1.0.0
 cachetools==6.2.1
 certifi==2025.10.5
 cffi==2.0.0
-charset-normalizer==3.4.3
+charset-normalizer==3.4.4
 click==8.3.0
-coverage==7.10.7
-cryptography==46.0.2
+coverage==7.11.0
+cryptography==46.0.3
 decorator==5.2.1
 flasgger==0.9.7.1
 Flask==3.1.2
@@ -51,7 +51,7 @@ pytest==8.4.2
 pytest-cov==7.0.0
 pytest-httpbin==2.1.0
 PyYAML==6.0.3
-referencing==0.36.2
+referencing==0.37.0
 requests==2.32.5
 rpds-py==0.27.1
 rsa==4.9.1
