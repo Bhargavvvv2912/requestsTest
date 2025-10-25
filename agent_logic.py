@@ -140,11 +140,7 @@ class DependencyAgent:
         installed_packages, _, _ = run_command([python_executable, "-m", "pip", "freeze"])
         return True, {"metrics": metrics, "packages": self._prune_pip_freeze(installed_packages)}, None
 
-
     def run(self):
-        if os.path.exists(self.config["METRICS_OUTPUT_FILE"]):
-            os.remove(self.config["METRICS_OUTPUT_FILE"])
-        
         is_pinned, _ = self._get_requirements_state()
         if not is_pinned:
             self._bootstrap_unpinned_requirements()
@@ -160,14 +156,12 @@ class DependencyAgent:
             pass_num += 1
             start_group(f"UPDATE PASS {pass_num}/{self.config['MAX_RUN_PASSES']}")
             
-            # --- THIS IS THE NEW "PROGRESSIVE BASELINE" ARCHITECTURE ---
-            # It starts as a copy, but will be updated as the pass progresses.
+            # This is the "living document" for the pass.
             progressive_baseline_path = Path(f"./pass_{pass_num}_progressive_reqs.txt")
             shutil.copy(self.requirements_path, progressive_baseline_path)
             
             changed_packages_this_pass = set()
 
-            # The initial update plan is built once at the start of the pass.
             packages_to_update = []
             with open(progressive_baseline_path, 'r') as f:
                 lines = [line.strip() for line in f if line.strip() and not line.strip().startswith('#')]
@@ -176,7 +170,6 @@ class DependencyAgent:
                 if '==' not in package_part: continue
                 parts = package_part.split('==')
                 package, current_version = self._get_package_name_from_spec(parts[0]), parts[1]
-
                 latest_version = self.get_latest_version(package)
                 if latest_version and parse_version(latest_version) > parse_version(current_version):
                     packages_to_update.append((package, current_version, latest_version))
@@ -192,14 +185,14 @@ class DependencyAgent:
                 break
 
             packages_to_update.sort(key=lambda p: self._calculate_update_risk(p[0], p[1], p[2]), reverse=True)
-            # ... (Prioritized update plan logging is the same) ...
+            # ... (Update plan logging)
 
             for i, (package, current_ver, target_ver) in enumerate(packages_to_update):
                 print(f"\n" + "-"*80); print(f"PULSE: [PASS {pass_num} | ATTEMPT {i+1}/{len(packages_to_update)}] Processing '{package}'"); print(f"PULSE: Changed packages this pass so far: {changed_packages_this_pass}"); print("-"*80)
                 
                 success, reason, _ = self.attempt_update_with_healing(
-                    package, current_ver, target_ver, [], # No dynamic constraints needed for now
-                    progressive_baseline_path, # ALWAYS uses the most up-to-date baseline for the pass
+                    package, current_ver, target_ver, [], 
+                    progressive_baseline_path, # ALWAYS uses the living document
                     changed_packages_this_pass
                 )
                 
@@ -208,14 +201,19 @@ class DependencyAgent:
                     if current_ver != reason:
                         changed_packages_this_pass.add(package)
                         
-                        # --- THIS IS THE FIX: UPDATE THE BASELINE IN-PLACE ---
-                        print(f"  -> SUCCESS. Locking in {package}=={reason} for the rest of this pass.")
+                        # YOUR FIX: UPDATE THE BASELINE IN-PLACE
+                        print(f"  -> SUCCESS. Locking in {package}=={reason} into the progressive baseline for this pass.")
                         with open(progressive_baseline_path, "r") as f:
                             temp_lines = f.readlines()
                         with open(progressive_baseline_path, "w") as f:
                             for line in temp_lines:
+                                # This handles environment markers correctly by only checking the package name
                                 if self._get_package_name_from_spec(line) == package:
-                                    f.write(f"{package}=={reason}\n")
+                                    # We preserve the old marker if one existed, just in case
+                                    marker_part = ""
+                                    if ";" in line:
+                                        marker_part = " ;" + line.split(";", 1)[1]
+                                    f.write(f"{package}=={reason}{marker_part}\n")
                                 else:
                                     f.write(line)
                 else:
@@ -224,17 +222,9 @@ class DependencyAgent:
             end_group()
 
             if changed_packages_this_pass:
-                # If changes were made, the final progressive baseline becomes the new official baseline.
-                print("\nPass complete. Freezing the final state of the progressive baseline.")
-                venv_dir = Path("./temp_freeze_venv")
-                freeze_success, python_executable, _ = self._install_and_build_environment(venv_dir, progressive_baseline_path)
-                if freeze_success:
-                    final_packages, _, _ = run_command([python_executable, "-m", "pip", "freeze"])
-                    with open(self.requirements_path, "w") as f:
-                        f.write(self._prune_pip_freeze(final_packages))
-                else:
-                    print("CRITICAL: Could not create final freeze environment. Reverting pass.", file=sys.stderr)
-                    # This is a safety valve - if the final combo fails, we don't save the changes.
+                # If changes were made, the final progressive baseline becomes the new official "Golden Record"
+                print("\nPass complete. Promoting the progressive baseline to the new Golden Record.")
+                shutil.copy(progressive_baseline_path, self.requirements_path)
             
             if progressive_baseline_path.exists():
                 progressive_baseline_path.unlink()
@@ -246,7 +236,7 @@ class DependencyAgent:
         if final_successful_updates:
             self._print_final_summary(final_successful_updates, final_failed_updates)
             self._run_final_health_check()
-            
+
     def _apply_pass_updates(self, successful_updates, baseline_reqs_path):
         """
         Takes the successful updates from a pass and creates a new, frozen requirements.txt.
@@ -341,6 +331,10 @@ class DependencyAgent:
         except Exception: return None
 
     def _try_install_and_validate(self, package_to_update, new_version, dynamic_constraints, baseline_reqs_path, is_probe, changed_packages):
+        """
+        Creates a temporary environment to test a single package update.
+        It runs a robust installation and then proceeds to validation.
+        """
         venv_dir = Path("./temp_venv")
         if venv_dir.exists(): shutil.rmtree(venv_dir)
         venv.create(venv_dir, with_pip=True)
@@ -348,72 +342,85 @@ class DependencyAgent:
         
         temp_reqs_path = venv_dir / "temp_requirements.txt"
         
+        # Create the temporary, modified requirements file for this specific test run.
         with open(baseline_reqs_path, "r") as f_read, open(temp_reqs_path, "w") as f_write:
+            # We must handle environment markers correctly here by only changing the version part.
             lines_for_file = []
             for line in f_read:
                 line = line.strip()
                 if not line or line.startswith('#'): continue
-                if self._get_package_name_from_spec(line) == package_to_update:
-                    lines_for_file.append(f"{package_to_update}=={new_version}")
+                
+                package_part = line.split(';')[0].strip()
+                
+                if self._get_package_name_from_spec(package_part) == package_to_update:
+                    # Preserve the marker if it exists, but update the version.
+                    marker_part = ""
+                    if ";" in line:
+                        marker_part = " ;" + line.split(";", 1)[1]
+                    lines_for_file.append(f"{package_to_update}=={new_version}{marker_part}")
                 else:
                     lines_for_file.append(line)
+
+            # We also need to add dynamic constraints, though we are not currently using them.
             for constraint in dynamic_constraints:
                  if self._get_package_name_from_spec(constraint) != package_to_update:
                     lines_for_file.append(constraint)
+
             f_write.write("\n".join(lines_for_file))
 
-        pip_command_robust = [python_executable, "-m", "pip", "install", "-r", str(temp_reqs_path)]
-        
-        old_version = "N/A"
-        with open(baseline_reqs_path, "r") as f:
-            for line in f:
-                if self._get_package_name_from_spec(line) == package_to_update:
-                    if '==' in line: old_version = line.strip().split('==')[1]
-
         if not is_probe:
-            start_group(f"Attempting to install {package_to_update}=={new_version}")
+            # We don't need a `start_group` here as the PULSE log is sufficient.
+            old_version = "N/A"
+            with open(baseline_reqs_path, "r") as f:
+                for line in f:
+                    if self._get_package_name_from_spec(line) == package_to_update:
+                        if '==' in line: old_version = line.split(';')[0].strip().split('==')[1]
             print(f"\nChange analysis: Updating '{package_to_update}' from {old_version} -> {new_version}")
 
-        _, stderr_install, returncode = run_command(pip_command_robust)
+        # --- STEP 1: The Reliable, Robust Install Attempt ---
+        _, stderr_install, returncode = run_command([python_executable, "-m", "pip", "install", "-r", str(temp_reqs_path)])
         
-        if not is_probe: end_group()
-        
+        # --- STEP 2: The Diagnostic Phase (if Step 1 failed) ---
         if returncode != 0:
             print("INFO: Main installation failed. Retrying with verbose logging to identify conflicting packages...")
             
+            # The "Diagnostic Retry": Rerun with command-line args to get a better error.
             with open(temp_reqs_path, 'r') as f:
                 requirements_list_for_log = [line.strip() for line in f if line.strip()]
-
             pip_command_for_logs = [python_executable, "-m", "pip", "install"] + requirements_list_for_log
             _, stderr_for_logs, _ = run_command(pip_command_for_logs)
-
-            # *** THE FIX IS HERE: A much more robust regex to capture the conflicting packages. ***
+            
+            # Primary Method: A robust regex to parse the human-readable conflict.
             conflict_match = re.search(r"Cannot install(?P<packages>[\s\S]+?)because", stderr_for_logs)
             
             reason = ""
             if conflict_match:
-                # Clean up the captured package list for a clean log
-                conflicting_packages = ' '.join(conflict_match.group('packages').split())
-                conflicting_packages = conflicting_packages.replace(' and ', ', ').replace(',', ', ')
+                conflicting_packages = ' '.join(conflict_match.group('packages').split()).replace(' and ', ', ').replace(',', ', ')
                 reason = f"Conflict between packages: {conflicting_packages}"
                 print(f"DIAGNOSIS: {reason}")
             else:
-                # This is the fallback if the regex still fails for some reason
+                # Fallback Method: If regex fails, use the LLM to summarize.
+                print("DIAGNOSIS: Could not parse specific conflicts. Falling back to LLM summary.")
                 llm_summary = self._ask_llm_to_summarize_error(stderr_install)
                 reason = f"Installation conflict. Summary: {llm_summary}"
             
             return False, reason, stderr_install
 
+        # --- STEP 3: The Validation Phase (if Step 1 succeeded) ---
+        
+        # The crucial check to skip redundant validation runs.
         if new_version == old_version and not changed_packages:
-             # This message will now be correctly logged by the binary search function
+             print("--> Validation skipped (no change).")
              return True, "Validation skipped (no change)", ""
 
         group_title = f"Validation for {package_to_update}=={new_version}"
         success, metrics, validation_output = validate_changes(python_executable, self.config, group_title=group_title)
+
         if not success:
             return False, "Validation script failed", validation_output
         return True, metrics, ""
-
+    
+    
     def attempt_update_with_healing(self, package, current_version, target_version, dynamic_constraints, baseline_reqs_path, changed_packages_this_pass):
         """
         Attempts to update a package and intelligently chooses a healing strategy
@@ -449,7 +456,7 @@ class DependencyAgent:
             )
         else: # ValidationConflict
             print("  -> Strategy: Using binary search backtrack for runtime/validation failure.")
-            healed_version = self._binary_search_backtrack(
+            healed_version = self._linear_search_backtrack(
                 package, current_version, target_version, dynamic_constraints, 
                 baseline_reqs_path, changed_packages_this_pass
             )
@@ -460,7 +467,7 @@ class DependencyAgent:
         return False, f"All healing attempts for {package} failed.", None
     
 
-    def _binary_search_backtrack(self, package, last_good_version, failed_version, dynamic_constraints, baseline_reqs_path, changed_packages):
+    def _linear_search_backtrack(self, package, last_good_version, failed_version, dynamic_constraints, baseline_reqs_path, changed_packages):
         start_group(f"Binary Search Backtrack for {package}")
         
         versions = self.get_all_versions_between(package, last_good_version, failed_version)
@@ -527,7 +534,7 @@ class DependencyAgent:
         intelligent version suggestions, then fall back to binary search if they fail.
         """
         print("  -> Phase 1: Querying LLM for version candidates based on error log.")
-        version_candidates = self._ask_llm_for_install_candidates(package, target_version, error_log, baseline_reqs_path)
+        version_candidates = self._ask_llm_for_install_candidates(package, current_version, target_version, error_log, baseline_reqs_path)
         
         if version_candidates:
             for candidate in version_candidates:
@@ -548,12 +555,12 @@ class DependencyAgent:
 
         # --- THIS IS THE CRUCIAL FALLBACK LOGIC YOU CORRECTLY POINTED OUT ---
         print("  -> Phase 2: LLM suggestions failed or were not provided. Falling back to binary search.")
-        return self._binary_search_backtrack(
+        return self._linear_search_backtrack(
             package, current_version, target_version, dynamic_constraints, 
             baseline_reqs_path, changed_packages
         )
     
-    def _ask_llm_for_install_candidates(self, package, failed_version, error_message, baseline_reqs_path):
+    def _ask_llm_for_install_candidates(self, package, current_version, failed_version, error_message, baseline_reqs_path):
         """
         Asks the LLM to analyze a pip installation error and the full requirements
         context, then suggest specific versions to try as a fix.
@@ -571,7 +578,7 @@ class DependencyAgent:
 
         prompt = f"""You are an expert Python dependency conflict resolver. A user tried to install '{package}=={failed_version}' and it failed with a 'ResolutionImpossible' error. Analyze the full requirements list and the pip error log.
 
-        Your task is to suggest a list of up to 3 specific, older, stable versions of '{package}' that are most likely to resolve this specific conflict. Prioritize the most recent stable releases first.
+        Your task is to suggest a list of up to 3 specific, older, stable versions of '{package}' that are most likely to resolve this specific conflict. Also, dont go below the {current_version}. Prioritize the most recent stable releases first.
 
         FULL REQUIREMENTS FILE:
         ---
@@ -582,9 +589,9 @@ class DependencyAgent:
         ---
         {error_message}
         ---
-
-        Respond ONLY with a valid Python list of up to 3 version strings in descending order. Do not include any explanation, preamble, or markdown.
-        Example response: ["1.2.3", "1.2.2", "1.1.5"]
+        Make sure, based on these logs, you are giving the latest working versions that will most likely resolve the conflict. Make sure that a simple linear search backtrack should not find any versions better than your suggestions. So, basically, you are like my most efficient person rather than a linear backtrack search, since it will take too long.
+        Respond ONLY with a valid Python list of up to 2 version strings in descending order. Do not include any explanation, preamble, or markdown.
+        Example response: ["1.2.3", "1.2.2"]
         """
         try:
             response = self.llm.generate_content(prompt, request_options={"timeout": 120})
