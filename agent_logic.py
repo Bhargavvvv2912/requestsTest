@@ -141,6 +141,9 @@ class DependencyAgent:
         return True, {"metrics": metrics, "packages": self._prune_pip_freeze(installed_packages)}, None
 
     def run(self):
+        if os.path.exists(self.config["METRICS_OUTPUT_FILE"]):
+            os.remove(self.config["METRICS_OUTPUT_FILE"])
+        
         is_pinned, _ = self._get_requirements_state()
         if not is_pinned:
             self._bootstrap_unpinned_requirements()
@@ -156,43 +159,58 @@ class DependencyAgent:
             pass_num += 1
             start_group(f"UPDATE PASS {pass_num}/{self.config['MAX_RUN_PASSES']}")
             
-            # This is the "living document" for the pass.
+            # This is our "living document" for the pass.
             progressive_baseline_path = Path(f"./pass_{pass_num}_progressive_reqs.txt")
             shutil.copy(self.requirements_path, progressive_baseline_path)
             
             changed_packages_this_pass = set()
 
+            # --- Build the initial update plan for this pass ---
             packages_to_update = []
             with open(progressive_baseline_path, 'r') as f:
                 lines = [line.strip() for line in f if line.strip() and not line.strip().startswith('#')]
             for line in lines:
                 package_part = line.split(';')[0].strip()
-                if '==' not in package_part: continue
+                if '==' not in package_part or line.strip().startswith('-e'): continue
+                
                 parts = package_part.split('==')
+                if len(parts) != 2: continue
+
                 package, current_version = self._get_package_name_from_spec(parts[0]), parts[1]
                 latest_version = self.get_latest_version(package)
                 if latest_version and parse_version(latest_version) > parse_version(current_version):
                     packages_to_update.append((package, current_version, latest_version))
 
+            # --- Handle the two "nothing to do" scenarios correctly ---
             if not packages_to_update:
                 if pass_num == 1:
                     print("\nInitial baseline is already fully up-to-date.")
+                    print("Running a final health check on the baseline for confirmation.")
                     self._run_final_health_check()
                 else:
-                    print("\nSystem has successfully converged.")
+                    print("\nNo further updates are available. The system has successfully converged.")
+                
                 end_group()
                 if progressive_baseline_path.exists(): progressive_baseline_path.unlink()
-                break
+                break # This is the correct exit.
 
+            # --- THIS IS THE LOGGING YOU CORRECTLY POINTED OUT WAS MISSING ---
             packages_to_update.sort(key=lambda p: self._calculate_update_risk(p[0], p[1], p[2]), reverse=True)
-            # ... (Update plan logging)
-
+            print("\nPrioritized Update Plan for this Pass:")
+            total_updates_in_plan = len(packages_to_update)
+            for i, (pkg, cur_ver, target_ver) in enumerate(packages_to_update):
+                score = self._calculate_update_risk(pkg, cur_ver, target_ver)
+                print(f"  {i+1}/{total_updates_in_plan}: {pkg} (Risk: {score:.2f}) -> {target_ver}")
+            # --- END OF FIX ---
+            
+            # --- The Main Healing and Update Loop ---
             for i, (package, current_ver, target_ver) in enumerate(packages_to_update):
-                print(f"\n" + "-"*80); print(f"PULSE: [PASS {pass_num} | ATTEMPT {i+1}/{len(packages_to_update)}] Processing '{package}'"); print(f"PULSE: Changed packages this pass so far: {changed_packages_this_pass}"); print("-"*80)
+                # The PULSE log provides a clear, narrative structure.
+                print(f"\n" + "-"*80); print(f"PULSE: [PASS {pass_num} | ATTEMPT {i+1}/{total_updates_in_plan}] Processing '{package}'"); print(f"PULSE: Changed packages this pass so far: {changed_packages_this_pass}"); print("-"*80)
                 
                 success, reason, _ = self.attempt_update_with_healing(
                     package, current_ver, target_ver, [], 
-                    progressive_baseline_path, # ALWAYS uses the living document
+                    progressive_baseline_path, # ALWAYS uses the "living document"
                     changed_packages_this_pass
                 )
                 
@@ -201,15 +219,13 @@ class DependencyAgent:
                     if current_ver != reason:
                         changed_packages_this_pass.add(package)
                         
-                        # YOUR FIX: UPDATE THE BASELINE IN-PLACE
+                        # YOUR FIX: UPDATE THE BASELINE IN-PLACE FOR THE NEXT ATTEMPT
                         print(f"  -> SUCCESS. Locking in {package}=={reason} into the progressive baseline for this pass.")
                         with open(progressive_baseline_path, "r") as f:
                             temp_lines = f.readlines()
                         with open(progressive_baseline_path, "w") as f:
                             for line in temp_lines:
-                                # This handles environment markers correctly by only checking the package name
-                                if self._get_package_name_from_spec(line) == package:
-                                    # We preserve the old marker if one existed, just in case
+                                if self._get_package_name_from_spec(line.split(';')[0]) == package:
                                     marker_part = ""
                                     if ";" in line:
                                         marker_part = " ;" + line.split(";", 1)[1]
@@ -221,18 +237,20 @@ class DependencyAgent:
             
             end_group()
 
+            # --- Promote the "living document" to the new Golden Record ---
             if changed_packages_this_pass:
-                # If changes were made, the final progressive baseline becomes the new official "Golden Record"
-                print("\nPass complete. Promoting the progressive baseline to the new Golden Record.")
+                print("\nPass complete with changes. Promoting the progressive baseline to the new Golden Record.")
                 shutil.copy(progressive_baseline_path, self.requirements_path)
             
             if progressive_baseline_path.exists():
                 progressive_baseline_path.unlink()
 
+            # The final convergence check.
             if not changed_packages_this_pass:
                 print("\nNo effective version changes were possible in this pass. The system has converged.")
                 break
         
+        # This part now only runs if updates were actually made.
         if final_successful_updates:
             self._print_final_summary(final_successful_updates, final_failed_updates)
             self._run_final_health_check()
@@ -420,7 +438,7 @@ class DependencyAgent:
             return False, "Validation script failed", validation_output
         return True, metrics, ""
     
-    
+
     def attempt_update_with_healing(self, package, current_version, target_version, dynamic_constraints, baseline_reqs_path, changed_packages_this_pass):
         """
         Attempts to update a package and intelligently chooses a healing strategy
