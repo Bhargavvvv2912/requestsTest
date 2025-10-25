@@ -37,7 +37,7 @@ jobs:
         run: pip install google-generativeai pypi-simple packaging
 
       - name: Update Google AI Library
-        run: pip install --upgrade google-generativeai
+        run: python -m pip install --upgrade google-generativeai
 
       - name: Run the Autonomous Agent
         run: python dependency_agent.py

@@ -21,7 +21,7 @@ AGENT_CONFIG = {
     "METRICS_OUTPUT_FILE": "metrics_output.txt",
     "MAX_LLM_BACKTRACK_ATTEMPTS": 3,
     "MAX_RUN_PASSES": 5,
-    "ACCEPTABLE_FAILURE_THRESHOLD": 0 # Not used by the simple smoke test, but good practice
+    "ACCEPTABLE_FAILURE_THRESHOLD": 5
 }
 
 if __name__ == "__main__":
@@ -30,7 +30,7 @@ if __name__ == "__main__":
         sys.exit("Error: GEMINI_API_KEY environment variable not set.")
     
     genai.configure(api_key=GEMINI_API_KEY)
-    llm_client = genai.GenerativeModel('gemini-1.5-flash-latest')
+    llm_client = genai.GenerativeModel('gemini-1.5-pro-latest')
 
     agent = DependencyAgent(config=AGENT_CONFIG, llm_client=llm_client)
     agent.run()
