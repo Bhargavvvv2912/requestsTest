@@ -109,6 +109,8 @@ class DependencyAgent:
         else:
             sys.exit("CRITICAL ERROR: All bootstrap healing attempts failed. Cannot establish a stable baseline.")
         end_group()
+
+    
     def _run_bootstrap_and_validate(self, venv_dir, requirements_source):
         """
         Installs a set of requirements into a venv and runs the validation script.
@@ -410,77 +412,51 @@ class DependencyAgent:
             return False, "Validation script failed", validation_output
         return True, metrics, ""
 
-    def attempt_update_with_healing(self, package, current_version, target_version, is_primary, dynamic_constraints, baseline_reqs_path, changed_packages_this_pass):
-        package_label = "(Primary)" if is_primary else "(Transient)"
+    def attempt_update_with_healing(self, package, current_version, target_version, dynamic_constraints, baseline_reqs_path, changed_packages_this_pass):
+        """
+        Attempts to update a package and intelligently chooses a healing strategy
+        based on the type of failure (Installation vs. Validation).
+        This is the main "Triage" function.
+        """
+        print(f"\nAttempting to validate {package}=={target_version}...")
         
-        # This is the function call that was causing the error. It is now fixed.
         success, result_data, stderr = self._try_install_and_validate(
-            package_to_update=package, 
-            new_version=target_version, 
-            dynamic_constraints=dynamic_constraints, 
-            baseline_reqs_path=baseline_reqs_path, 
-            is_probe=False, 
-            changed_packages=changed_packages_this_pass
+            package, target_version, dynamic_constraints, baseline_reqs_path, 
+            is_probe=False, changed_packages=changed_packages_this_pass
         )
         
         if success:
-            # We don't need to call _handle_success here anymore.
-            # We just return the version that was successful.
-            return True, target_version, None
+            print(f"Direct update to {package}=={target_version} succeeded.")
+            return True, result_data if "skipped" in str(result_data) else target_version, None
 
+        # --- THIS IS THE CORRECTED TRIAGE LOGIC ---
+        # We determine the failure type based on the content of the "reason" string.
+        failure_type = "ValidationConflict" if "Validation script failed" in str(result_data) else "InstallationConflict"
+        
         print(f"\nINFO: Initial update for '{package}' failed. Reason: '{result_data}'")
         start_group("View Full Error Log for Initial Failure"); print(stderr); end_group()
-        print("INFO: Entering unified healing mode.")
+        print(f"DIAGNOSIS: Detected a {failure_type}.")
+        print("INFO: Entering specialized healing mode.")
         
-        root_cause = self._ask_llm_for_root_cause(package, stderr)
-        if root_cause and root_cause.get("package") != package:
-            constraint = f"{root_cause.get('package')}{root_cause.get('suggested_constraint')}"
-            return False, f"Diagnosed incompatibility with {root_cause.get('package')}", constraint
+        healed_version = None
+        if failure_type == "InstallationConflict":
+            print("  -> Strategy: Using LLM-first approach with binary search fallback.")
+            healed_version = self._heal_with_llm_first(
+                package, current_version, target_version, dynamic_constraints, 
+                baseline_reqs_path, changed_packages_this_pass, stderr  # Correctly passing stderr
+            )
+        else: # ValidationConflict
+            print("  -> Strategy: Using binary search backtrack for runtime/validation failure.")
+            healed_version = self._binary_search_backtrack(
+                package, current_version, target_version, dynamic_constraints, 
+                baseline_reqs_path, changed_packages_this_pass
+            )
 
-        version_candidates = self._ask_llm_for_version_candidates(package, target_version)
-        if version_candidates:
-            for candidate in version_candidates:
-                if parse_version(candidate) <= parse_version(current_version): continue
-                print(f"INFO: Attempting LLM-suggested backtrack for {package} to {candidate}")
-                # And here...
-                success, _, _ = self._try_install_and_validate(
-                    package_to_update=package, 
-                    new_version=candidate, 
-                    dynamic_constraints=dynamic_constraints, 
-                    baseline_reqs_path=baseline_reqs_path,
-                    is_probe=False, # This is a full validation attempt
-                    changed_packages=changed_packages_this_pass
-                )
-                if success:
-                    return True, candidate, None
-
-        print(f"INFO: LLM suggestions failed. Falling back to Binary Search backtracking.")
-        # And here...
-        found_version = self._binary_search_backtrack(
-            package=package, 
-            last_good_version=current_version, 
-            failed_version=target_version, 
-            dynamic_constraints=dynamic_constraints, 
-            baseline_reqs_path=baseline_reqs_path, 
-            changed_packages=changed_packages_this_pass
-        )
-        if found_version:
-            return True, found_version, None
-
-        return False, "All backtracking attempts failed.", None
+        if healed_version:
+            return True, healed_version, None
+        
+        return False, f"All healing attempts for {package} failed.", None
     
-    def _handle_success(self, package, new_version, metrics, package_label, installed_packages=None):
-        if metrics and "not available" not in metrics:
-            print(f"\n** SUCCESS: {package} {package_label} finalized at {new_version} and passed validation. **")
-            print("\n".join([f"  {line}" for line in metrics.split('\n')]) + "\n")
-            with open(self.config["METRICS_OUTPUT_FILE"], "w") as f: f.write(metrics)
-        else:
-            print(f"\n** SUCCESS: {package} {package_label} finalized at {new_version} and passed (metrics unavailable). **\n")
-        
-        if not installed_packages:
-            python_executable_in_venv = str(Path("./temp_venv/bin/python"))
-            installed_packages, _, _ = run_command([python_executable_in_venv, "-m", "pip", "freeze"])
-        with open(self.requirements_path, "w") as f: f.write(self._prune_pip_freeze(installed_packages))
 
     def _binary_search_backtrack(self, package, last_good_version, failed_version, dynamic_constraints, baseline_reqs_path, changed_packages):
         start_group(f"Binary Search Backtrack for {package}")
@@ -542,34 +518,82 @@ class DependencyAgent:
         lines = freeze_output.strip().split('\n')
         return "\n".join([line for line in lines if '==' in line and not line.startswith('-e')])
 
-    def _ask_llm_for_root_cause(self, package, error_message):
-        if not self.llm_available: return {}
-        py_version = f"{sys.version_info.major}.{sys.version_info.minor}"
-        with open(self.config["REQUIREMENTS_FILE"], "r") as f:
-            current_requirements = f.read()
-        prompt = f"""You are an expert Python dependency diagnostician AI. Analyze the error that occurred when updating '{package}' in a project with these requirements:
----
-{current_requirements}
----
-The error on Python {py_version} was:
----
-{error_message}
----
-Respond in JSON. Is the root_cause 'self' or 'incompatibility'? If incompatibility, name the 'package' and 'suggested_constraint'. Example: {{"root_cause": "incompatibility", "package": "numpy", "suggested_constraint": "<2.0"}}"""
-        try:
-            response = self.llm.generate_content(prompt)
-            json_text = re.search(r'\{.*\}', response.text, re.DOTALL).group(0)
-            return json.loads(json_text)
-        except Exception: return {}
 
-    def _ask_llm_for_version_candidates(self, package, failed_version):
-        if not self.llm_available: return []
-        prompt = f"Give a Python list of the {self.config['MAX_LLM_BACKTRACK_ATTEMPTS']} most recent, previous release versions of the python package '{package}', starting from the version just before '{failed_version}'. The list must be in descending order. Respond ONLY with the list."
+    def _heal_with_llm_first(self, package, current_version, target_version, dynamic_constraints, baseline_reqs_path, changed_packages, error_log):
+        """
+        Your brilliant design: For installation conflicts, first ask the LLM for
+        intelligent version suggestions, then fall back to binary search if they fail.
+        """
+        print("  -> Phase 1: Querying LLM for version candidates based on error log.")
+        version_candidates = self._ask_llm_for_install_candidates(package, target_version, error_log, baseline_reqs_path)
+        
+        if version_candidates:
+            for candidate in version_candidates:
+                # Ensure we only try versions older than the failed one but newer than current
+                if not (parse_version(current_version) < parse_version(candidate) < parse_version(target_version)):
+                    continue
+                
+                print(f"  -> INFO: Attempting LLM-suggested backtrack for {package} to {candidate}")
+                success, _, _ = self._try_install_and_validate(
+                    package, candidate, dynamic_constraints, baseline_reqs_path,
+                    is_probe=False, changed_packages=changed_packages
+                )
+                if success:
+                    print(f"  -> SUCCESS: LLM-suggested version {candidate} passed validation.")
+                    return candidate
+        else:
+            print("  -> INFO: LLM provided no actionable version candidates.")
+
+        # --- THIS IS THE CRUCIAL FALLBACK LOGIC YOU CORRECTLY POINTED OUT ---
+        print("  -> Phase 2: LLM suggestions failed or were not provided. Falling back to binary search.")
+        return self._binary_search_backtrack(
+            package, current_version, target_version, dynamic_constraints, 
+            baseline_reqs_path, changed_packages
+        )
+    
+    def _ask_llm_for_install_candidates(self, package, failed_version, error_message, baseline_reqs_path):
+        """
+        Asks the LLM to analyze a pip installation error and the full requirements
+        context, then suggest specific versions to try as a fix.
+        """
+        if not self.llm_available:
+            print("  -> LLM SKIPPED: LLM is not available.")
+            return []
+        
         try:
-            response = self.llm.generate_content(prompt)
-            match = re.search(r'(\[.*?\])', response.text, re.DOTALL)
-            if not match: return []
-            return ast.literal_eval(match.group(1))
-        except ResourceExhausted:
-            self.llm_available = False; return []
-        except Exception: return []
+            with open(baseline_reqs_path, "r") as f:
+                current_requirements = f.read()
+        except FileNotFoundError:
+            print("  -> LLM WARNING: Could not read baseline requirements file for context.")
+            current_requirements = "Not available."
+
+        prompt = f"""You are an expert Python dependency conflict resolver. A user tried to install '{package}=={failed_version}' and it failed with a 'ResolutionImpossible' error. Analyze the full requirements list and the pip error log.
+
+        Your task is to suggest a list of up to 3 specific, older, stable versions of '{package}' that are most likely to resolve this specific conflict. Prioritize the most recent stable releases first.
+
+        FULL REQUIREMENTS FILE:
+        ---
+        {current_requirements}
+        ---
+
+        PIP INSTALL ERROR LOG:
+        ---
+        {error_message}
+        ---
+
+        Respond ONLY with a valid Python list of up to 3 version strings in descending order. Do not include any explanation, preamble, or markdown.
+        Example response: ["1.2.3", "1.2.2", "1.1.5"]
+        """
+        try:
+            response = self.llm.generate_content(prompt, request_options={"timeout": 120})
+            match = re.search(r'\[.*\]', response.text, re.DOTALL)
+            if not match: 
+                print(f"  -> LLM WARNING: Response did not contain a valid list. Response: {response.text}")
+                return []
+            
+            candidates = ast.literal_eval(match.group(0))
+            print(f"  -> LLM provided {len(candidates)} version candidates: {candidates}")
+            return candidates
+        except Exception as e:
+            print(f"  -> LLM ERROR: Failed to get/parse version candidates: {type(e).__name__} - {e}")
+            return []
