@@ -385,10 +385,8 @@ class DependencyAgent:
                     lines_for_file.append(constraint)
 
             f_write.write("\n".join(lines_for_file))
-
+        old_version = "N/A"
         if not is_probe:
-            # We don't need a `start_group` here as the PULSE log is sufficient.
-            old_version = "N/A"
             with open(baseline_reqs_path, "r") as f:
                 for line in f:
                     if self._get_package_name_from_spec(line) == package_to_update:
@@ -413,7 +411,8 @@ class DependencyAgent:
             
             reason = ""
             if conflict_match:
-                conflicting_packages = ' '.join(conflict_match.group('packages').split()).replace(' and ', ', ').replace(',', ', ')
+                conflicting_packages = ' '.join(conflict_match.group('packages').split())
+                conflicting_packages = conflicting_packages.replace(' and ', ', ').replace(',', ', ')
                 reason = f"Conflict between packages: {conflicting_packages}"
                 print(f"DIAGNOSIS: {reason}")
             else:
@@ -423,8 +422,6 @@ class DependencyAgent:
                 reason = f"Installation conflict. Summary: {llm_summary}"
             
             return False, reason, stderr_install
-
-        # --- STEP 3: The Validation Phase (if Step 1 succeeded) ---
         
         # The crucial check to skip redundant validation runs.
         if new_version == old_version and not changed_packages:
