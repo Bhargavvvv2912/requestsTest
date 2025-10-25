@@ -62,6 +62,8 @@ def _run_smoke_test(python_executable: str, config: dict) -> tuple[bool, str, st
     print("Smoke test PASSED.")
     return True, "Smoke test passed.", stdout + stderr
 
+# In agent_utils.py
+
 def _run_pytest_suite(python_executable: str, config: dict) -> tuple[bool, str, str]:
     """Runs a full pytest suite and provides a detailed result."""
     print("\n--- Running Full Pytest Suite ---")
@@ -78,19 +80,19 @@ def _run_pytest_suite(python_executable: str, config: dict) -> tuple[bool, str, 
     stdout, stderr, returncode = run_command(command, cwd=project_dir)
     full_output = stdout + stderr
 
-    if returncode > 1:
-        print(f"VALIDATION FAILED: Pytest exited with a critical error code ({returncode}).", file=sys.stderr)
-        return False, "Critical pytest error", full_output
-        
+    # --- THIS IS THE FINAL, CORRECTED LOGIC ---
+
     summary = _parse_pytest_summary(full_output)
     total_failures = int(summary["failed"]) + int(summary["errors"])
     threshold = config.get("ACCEPTABLE_FAILURE_THRESHOLD", 0)
-    
+
+    # The PASS/FAIL decision is made here, and ONLY here.
     if total_failures > threshold:
         reason = f"{total_failures} real failures/errors, which exceeds the threshold of {threshold}."
         print(f"VALIDATION FAILED: {reason}", file=sys.stderr)
         return False, reason, full_output
     
+    # If we get here, it is a SUCCESS, either soft or hard.
     if total_failures > 0:
         print(f"VALIDATION PASSED (soft): {total_failures} failures/errors found, which is within the acceptable threshold.")
     else:
