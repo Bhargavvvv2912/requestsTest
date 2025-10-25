@@ -133,7 +133,7 @@ class DependencyAgent:
             return False, None, f"Failed to install dependencies. Error: {stderr_install}"
 
         # Now, the absolute path is passed to validate_changes.
-        success, metrics, validation_output = validate_changes(python_executable, group_title="Running Validation on New Baseline")
+        success, metrics, validation_output = validate_changes(python_executable, self.config, group_title="Running Validation on New Baseline")
         if not success:
             return False, None, validation_output
             
@@ -319,7 +319,7 @@ class DependencyAgent:
             print("CRITICAL ERROR: Final installation of combined dependencies failed!", file=sys.stderr); return
 
         # Then, run the validation using the newly created environment.
-        success, metrics, _ = validate_changes(python_executable, group_title="Final System Health Check")
+        success, metrics, _ = validate_changes(python_executable, self.config, group_title="Final System Health Check")
         
         if success and metrics and "not available" not in metrics:
             print("\n" + "="*70); print("=== FINAL METRICS FOR THE FULLY UPDATED ENVIRONMENT ===")
@@ -407,7 +407,7 @@ class DependencyAgent:
              return True, "Validation skipped (no change)", ""
 
         group_title = f"Validation for {package_to_update}=={new_version}"
-        success, metrics, validation_output = validate_changes(python_executable, group_title=group_title)
+        success, metrics, validation_output = validate_changes(python_executable, self.config, group_title=group_title)
         if not success:
             return False, "Validation script failed", validation_output
         return True, metrics, ""
