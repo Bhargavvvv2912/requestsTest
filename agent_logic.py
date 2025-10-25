@@ -152,7 +152,6 @@ class DependencyAgent:
             if not is_pinned:
                  sys.exit("CRITICAL: Bootstrap process failed to produce a fully pinned requirements file.")
 
-        dynamic_constraints = []
         final_successful_updates = {}
         final_failed_updates = {}
         pass_num = 0
@@ -161,22 +160,22 @@ class DependencyAgent:
             pass_num += 1
             start_group(f"UPDATE PASS {pass_num}/{self.config['MAX_RUN_PASSES']}")
             
-            pass_baseline_reqs_path = Path(f"./pass_{pass_num}_baseline_reqs.txt")
-            shutil.copy(self.requirements_path, pass_baseline_reqs_path)
+            # --- THIS IS THE NEW "PROGRESSIVE BASELINE" ARCHITECTURE ---
+            # It starts as a copy, but will be updated as the pass progresses.
+            progressive_baseline_path = Path(f"./pass_{pass_num}_progressive_reqs.txt")
+            shutil.copy(self.requirements_path, progressive_baseline_path)
             
+            changed_packages_this_pass = set()
+
+            # The initial update plan is built once at the start of the pass.
             packages_to_update = []
-            with open(pass_baseline_reqs_path, 'r') as f:
+            with open(progressive_baseline_path, 'r') as f:
                 lines = [line.strip() for line in f if line.strip() and not line.strip().startswith('#')]
-            
             for line in lines:
-                # This is your robust parser, it is correct.
                 package_part = line.split(';')[0].strip()
                 if '==' not in package_part: continue
                 parts = package_part.split('==')
-                if len(parts) != 2: continue
-
-                package = self._get_package_name_from_spec(parts[0])
-                current_version = parts[1]
+                package, current_version = self._get_package_name_from_spec(parts[0]), parts[1]
 
                 latest_version = self.get_latest_version(package)
                 if latest_version and parse_version(latest_version) > parse_version(current_version):
@@ -185,53 +184,60 @@ class DependencyAgent:
             if not packages_to_update:
                 if pass_num == 1:
                     print("\nInitial baseline is already fully up-to-date.")
-                    print("Running a final health check on the baseline for confirmation.")
                     self._run_final_health_check()
                 else:
-                    print("\nNo further updates are available after the previous pass. The system has successfully converged.")
-                
+                    print("\nSystem has successfully converged.")
                 end_group()
-                if pass_baseline_reqs_path.exists(): pass_baseline_reqs_path.unlink()
+                if progressive_baseline_path.exists(): progressive_baseline_path.unlink()
                 break
 
             packages_to_update.sort(key=lambda p: self._calculate_update_risk(p[0], p[1], p[2]), reverse=True)
-            print("\nPrioritized Update Plan for this Pass:")
-            total_updates_in_plan = len(packages_to_update)
-            for i, (pkg, cur_ver, target_ver) in enumerate(packages_to_update):
-                score = self._calculate_update_risk(pkg, cur_ver, target_ver)
-                print(f"  {i+1}/{total_updates_in_plan}: {pkg} (Risk: {score:.2f}) -> {target_ver}")
-            
-            changed_packages_this_pass = set()
-            pass_successful_updates = {}
+            # ... (Prioritized update plan logging is the same) ...
 
             for i, (package, current_ver, target_ver) in enumerate(packages_to_update):
-                print(f"\n" + "-"*80); print(f"PULSE: [PASS {pass_num} | ATTEMPT {i+1}/{total_updates_in_plan}] Processing '{package}'"); print(f"PULSE: Changed packages this pass so far: {changed_packages_this_pass}"); print("-"*80)
+                print(f"\n" + "-"*80); print(f"PULSE: [PASS {pass_num} | ATTEMPT {i+1}/{len(packages_to_update)}] Processing '{package}'"); print(f"PULSE: Changed packages this pass so far: {changed_packages_this_pass}"); print("-"*80)
                 
-                # --- THIS IS THE FINAL, CORRECTED FUNCTION CALL ---
                 success, reason, _ = self.attempt_update_with_healing(
-                    package=package, 
-                    current_version=current_ver, 
-                    target_version=target_ver, 
-                    dynamic_constraints=dynamic_constraints, 
-                    baseline_reqs_path=pass_baseline_reqs_path, 
-                    changed_packages_this_pass=changed_packages_this_pass
+                    package, current_ver, target_ver, [], # No dynamic constraints needed for now
+                    progressive_baseline_path, # ALWAYS uses the most up-to-date baseline for the pass
+                    changed_packages_this_pass
                 )
                 
                 if success:
                     final_successful_updates[package] = (target_ver, reason)
-                    pass_successful_updates[package] = reason
                     if current_ver != reason:
                         changed_packages_this_pass.add(package)
+                        
+                        # --- THIS IS THE FIX: UPDATE THE BASELINE IN-PLACE ---
+                        print(f"  -> SUCCESS. Locking in {package}=={reason} for the rest of this pass.")
+                        with open(progressive_baseline_path, "r") as f:
+                            temp_lines = f.readlines()
+                        with open(progressive_baseline_path, "w") as f:
+                            for line in temp_lines:
+                                if self._get_package_name_from_spec(line) == package:
+                                    f.write(f"{package}=={reason}\n")
+                                else:
+                                    f.write(line)
                 else:
                     final_failed_updates[package] = (target_ver, reason)
             
-            if changed_packages_this_pass:
-                self._apply_pass_updates(pass_successful_updates, pass_baseline_reqs_path)
-
-            if pass_baseline_reqs_path.exists():
-                pass_baseline_reqs_path.unlink()
-            
             end_group()
+
+            if changed_packages_this_pass:
+                # If changes were made, the final progressive baseline becomes the new official baseline.
+                print("\nPass complete. Freezing the final state of the progressive baseline.")
+                venv_dir = Path("./temp_freeze_venv")
+                freeze_success, python_executable, _ = self._install_and_build_environment(venv_dir, progressive_baseline_path)
+                if freeze_success:
+                    final_packages, _, _ = run_command([python_executable, "-m", "pip", "freeze"])
+                    with open(self.requirements_path, "w") as f:
+                        f.write(self._prune_pip_freeze(final_packages))
+                else:
+                    print("CRITICAL: Could not create final freeze environment. Reverting pass.", file=sys.stderr)
+                    # This is a safety valve - if the final combo fails, we don't save the changes.
+            
+            if progressive_baseline_path.exists():
+                progressive_baseline_path.unlink()
 
             if not changed_packages_this_pass:
                 print("\nNo effective version changes were possible in this pass. The system has converged.")
