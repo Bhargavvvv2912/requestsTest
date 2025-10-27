@@ -571,7 +571,7 @@ class DependencyAgent:
         
         # If the LLM gave no candidates, or its best guess failed, we fall back.
         print("  -> Phase 2: LLM failed. Falling back to the 100% reliable linear scan.")
-        return self._linear_scan_backtrack(
+        return self._linear_search_backtrack(
             package, current_version, target_version, dynamic_constraints, 
             baseline_reqs_path, changed_packages
         )
