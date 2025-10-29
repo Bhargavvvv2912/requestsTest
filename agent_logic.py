@@ -369,106 +369,106 @@ class DependencyAgent:
 
     # In agent_logic.py
 
-def _try_install_and_validate(self, package_to_update, new_version, dynamic_constraints, baseline_reqs_path, is_probe):
-    """
-    Creates a temporary environment to test a single package update.
-    It runs a robust installation and then proceeds to validation.
-    This version includes an optimization to skip redundant validation runs.
-    """
-    venv_dir = Path("./temp_venv")
-    if venv_dir.exists(): shutil.rmtree(venv_dir)
-    venv.create(venv_dir, with_pip=True)
-    python_executable = str((venv_dir / "bin" / "python").resolve())
-    
-    # Determine the 'old_version' from the current progressive baseline for comparison.
-    old_version = "N/A"
-    with open(baseline_reqs_path, "r") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith('#'): continue
-            # Ensure we're checking the correct package, ignoring markers
-            if self._get_package_name_from_spec(line.split(';')[0]) == package_to_update:
-                if '==' in line:
-                    old_version = line.split(';')[0].strip().split('==')[1]
-                    break
-    
-    # --- START OF OPTIMIZATION LOGIC ---
-    # If the new version is the same as the old version in the baseline,
-    # it means no change is being made. The environment state is identical to the
-    # last known-good state, so we can skip the expensive validation step.
-    if new_version == old_version:
-        # We only print the verbose analysis if it's not a quick probe from the backtrack algorithm
+    def _try_install_and_validate(self, package_to_update, new_version, dynamic_constraints, baseline_reqs_path, is_probe):
+        """
+        Creates a temporary environment to test a single package update.
+        It runs a robust installation and then proceeds to validation.
+        This version includes an optimization to skip redundant validation runs.
+        """
+        venv_dir = Path("./temp_venv")
+        if venv_dir.exists(): shutil.rmtree(venv_dir)
+        venv.create(venv_dir, with_pip=True)
+        python_executable = str((venv_dir / "bin" / "python").resolve())
+        
+        # Determine the 'old_version' from the current progressive baseline for comparison.
+        old_version = "N/A"
+        with open(baseline_reqs_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'): continue
+                # Ensure we're checking the correct package, ignoring markers
+                if self._get_package_name_from_spec(line.split(';')[0]) == package_to_update:
+                    if '==' in line:
+                        old_version = line.split(';')[0].strip().split('==')[1]
+                        break
+        
+        # --- START OF OPTIMIZATION LOGIC ---
+        # If the new version is the same as the old version in the baseline,
+        # it means no change is being made. The environment state is identical to the
+        # last known-good state, so we can skip the expensive validation step.
+        if new_version == old_version:
+            # We only print the verbose analysis if it's not a quick probe from the backtrack algorithm
+            if not is_probe:
+                print(f"--> Change analysis: '{package_to_update}' version remains at {old_version}.")
+                print("--> Validation skipped (no change).")
+            # Return True because staying at the current version is a successful and valid outcome.
+            # The special string in the 'reason' field signals to the caller that no update was made.
+            return True, "Validation skipped (no change)", ""
+
         if not is_probe:
-             print(f"--> Change analysis: '{package_to_update}' version remains at {old_version}.")
-             print("--> Validation skipped (no change).")
-        # Return True because staying at the current version is a successful and valid outcome.
-        # The special string in the 'reason' field signals to the caller that no update was made.
-        return True, "Validation skipped (no change)", ""
+            print(f"\nChange analysis: Updating '{package_to_update}' from {old_version} -> {new_version}. Validation is required.")
+        # --- END OF OPTIMIZATION LOGIC ---
 
-    if not is_probe:
-        print(f"\nChange analysis: Updating '{package_to_update}' from {old_version} -> {new_version}. Validation is required.")
-    # --- END OF OPTIMIZATION LOGIC ---
+        temp_reqs_path = venv_dir / "temp_requirements.txt"
+        
+        # Create the temporary, modified requirements file for this specific test run.
+        with open(baseline_reqs_path, "r") as f_read, open(temp_reqs_path, "w") as f_write:
+            lines_for_file = []
+            for line in f_read:
+                line = line.strip()
+                if not line or line.startswith('#'): continue
+                
+                package_part = line.split(';')[0].strip()
+                
+                if self._get_package_name_from_spec(package_part) == package_to_update:
+                    marker_part = ""
+                    if ";" in line:
+                        marker_part = " ;" + line.split(";", 1)[1]
+                    lines_for_file.append(f"{package_to_update}=={new_version}{marker_part}")
+                else:
+                    lines_for_file.append(line)
 
-    temp_reqs_path = venv_dir / "temp_requirements.txt"
-    
-    # Create the temporary, modified requirements file for this specific test run.
-    with open(baseline_reqs_path, "r") as f_read, open(temp_reqs_path, "w") as f_write:
-        lines_for_file = []
-        for line in f_read:
-            line = line.strip()
-            if not line or line.startswith('#'): continue
+            for constraint in dynamic_constraints:
+                if self._get_package_name_from_spec(constraint) != package_to_update:
+                    lines_for_file.append(constraint)
+
+            f_write.write("\n".join(lines_for_file))
+
+        # --- STEP 1: The Reliable, Robust Install Attempt ---
+        _, stderr_install, returncode = run_command([python_executable, "-m", "pip", "install", "-r", str(temp_reqs_path)])
+        
+        # --- STEP 2: The Diagnostic Phase (if Step 1 failed) ---
+        if returncode != 0:
+            print("INFO: Main installation failed. Retrying with verbose logging to identify conflicting packages...")
             
-            package_part = line.split(';')[0].strip()
+            with open(temp_reqs_path, 'r') as f:
+                requirements_list_for_log = [line.strip() for line in f if line.strip()]
+            pip_command_for_logs = [python_executable, "-m", "pip", "install"] + requirements_list_for_log
+            _, stderr_for_logs, _ = run_command(pip_command_for_logs)
             
-            if self._get_package_name_from_spec(package_part) == package_to_update:
-                marker_part = ""
-                if ";" in line:
-                    marker_part = " ;" + line.split(";", 1)[1]
-                lines_for_file.append(f"{package_to_update}=={new_version}{marker_part}")
+            conflict_match = re.search(r"Cannot install(?P<packages>[\s\S]+?)because", stderr_for_logs)
+            
+            reason = ""
+            if conflict_match:
+                conflicting_packages = ' '.join(conflict_match.group('packages').split())
+                conflicting_packages = conflicting_packages.replace(' and ', ', ').replace(',', ', ')
+                reason = f"Conflict between packages: {conflicting_packages}"
+                print(f"DIAGNOSIS: {reason}")
             else:
-                lines_for_file.append(line)
-
-        for constraint in dynamic_constraints:
-             if self._get_package_name_from_spec(constraint) != package_to_update:
-                lines_for_file.append(constraint)
-
-        f_write.write("\n".join(lines_for_file))
-
-    # --- STEP 1: The Reliable, Robust Install Attempt ---
-    _, stderr_install, returncode = run_command([python_executable, "-m", "pip", "install", "-r", str(temp_reqs_path)])
-    
-    # --- STEP 2: The Diagnostic Phase (if Step 1 failed) ---
-    if returncode != 0:
-        print("INFO: Main installation failed. Retrying with verbose logging to identify conflicting packages...")
+                print("DIAGNOSIS: Could not parse specific conflicts. Falling back to LLM summary.")
+                llm_summary = self._ask_llm_to_summarize_error(stderr_install)
+                reason = f"Installation conflict. Summary: {llm_summary}"
+            
+            return False, reason, stderr_install
         
-        with open(temp_reqs_path, 'r') as f:
-            requirements_list_for_log = [line.strip() for line in f if line.strip()]
-        pip_command_for_logs = [python_executable, "-m", "pip", "install"] + requirements_list_for_log
-        _, stderr_for_logs, _ = run_command(pip_command_for_logs)
-        
-        conflict_match = re.search(r"Cannot install(?P<packages>[\s\S]+?)because", stderr_for_logs)
-        
-        reason = ""
-        if conflict_match:
-            conflicting_packages = ' '.join(conflict_match.group('packages').split())
-            conflicting_packages = conflicting_packages.replace(' and ', ', ').replace(',', ', ')
-            reason = f"Conflict between packages: {conflicting_packages}"
-            print(f"DIAGNOSIS: {reason}")
-        else:
-            print("DIAGNOSIS: Could not parse specific conflicts. Falling back to LLM summary.")
-            llm_summary = self._ask_llm_to_summarize_error(stderr_install)
-            reason = f"Installation conflict. Summary: {llm_summary}"
-        
-        return False, reason, stderr_install
-    
-    # --- STEP 3: Validation of the new environment ---
-    group_title = f"Validation for {package_to_update}=={new_version}"
-    success, metrics, validation_output = validate_changes(python_executable, self.config, group_title=group_title)
+        # --- STEP 3: Validation of the new environment ---
+        group_title = f"Validation for {package_to_update}=={new_version}"
+        success, metrics, validation_output = validate_changes(python_executable, self.config, group_title=group_title)
 
-    if not success:
-        return False, "Validation script failed", validation_output
-    
-    return True, metrics, ""
+        if not success:
+            return False, "Validation script failed", validation_output
+        
+        return True, metrics, ""
     
 
     def attempt_update_with_healing(self, package, current_version, target_version, dynamic_constraints, baseline_reqs_path, changed_packages_this_pass):
