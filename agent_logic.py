@@ -140,120 +140,139 @@ class DependencyAgent:
         installed_packages, _, _ = run_command([python_executable, "-m", "pip", "freeze"])
         return True, {"metrics": metrics, "packages": self._prune_pip_freeze(installed_packages)}, None
 
-    def run(self):
-        if os.path.exists(self.config["METRICS_OUTPUT_FILE"]):
-            os.remove(self.config["METRICS_OUTPUT_FILE"])
-        
+   # In agent_logic.py
+
+def run(self):
+    if os.path.exists(self.config["METRICS_OUTPUT_FILE"]):
+        os.remove(self.config["METRICS_OUTPUT_FILE"])
+    
+    is_pinned, _ = self._get_requirements_state()
+    if not is_pinned:
+        self._bootstrap_unpinned_requirements()
         is_pinned, _ = self._get_requirements_state()
         if not is_pinned:
-            self._bootstrap_unpinned_requirements()
-            is_pinned, _ = self._get_requirements_state()
-            if not is_pinned:
-                 sys.exit("CRITICAL: Bootstrap process failed to produce a fully pinned requirements file.")
+             sys.exit("CRITICAL: Bootstrap process failed to produce a fully pinned requirements file.")
 
-        final_successful_updates = {}
-        final_failed_updates = {}
-        pass_num = 0
+    final_successful_updates = {}
+    final_failed_updates = {}
+    pass_num = 0
+    
+    while pass_num < self.config["MAX_RUN_PASSES"]:
+        pass_num += 1
+        start_group(f"UPDATE PASS {pass_num}/{self.config['MAX_RUN_PASSES']}")
         
-        while pass_num < self.config["MAX_RUN_PASSES"]:
-            pass_num += 1
-            start_group(f"UPDATE PASS {pass_num}/{self.config['MAX_RUN_PASSES']}")
+        progressive_baseline_path = Path(f"./pass_{pass_num}_progressive_reqs.txt")
+        shutil.copy(self.requirements_path, progressive_baseline_path)
+        
+        changed_packages_this_pass = set()
+
+        # --- Build the initial update plan for this pass ---
+        packages_to_update = []
+        with open(progressive_baseline_path, 'r') as f:
+            lines = [line.strip() for line in f if line.strip() and not line.strip().startswith('#')]
+        for line in lines:
+            package_part = line.split(';')[0].strip()
+            if '==' not in package_part or line.strip().startswith('-e'): continue
             
-            # This is our "living document" for the pass.
-            progressive_baseline_path = Path(f"./pass_{pass_num}_progressive_reqs.txt")
-            shutil.copy(self.requirements_path, progressive_baseline_path)
-            
-            changed_packages_this_pass = set()
+            parts = package_part.split('==')
+            if len(parts) != 2: continue
 
-            # --- Build the initial update plan for this pass ---
-            packages_to_update = []
-            with open(progressive_baseline_path, 'r') as f:
-                lines = [line.strip() for line in f if line.strip() and not line.strip().startswith('#')]
-            for line in lines:
-                package_part = line.split(';')[0].strip()
-                if '==' not in package_part or line.strip().startswith('-e'): continue
-                
-                parts = package_part.split('==')
-                if len(parts) != 2: continue
+            package, current_version = self._get_package_name_from_spec(parts[0]), parts[1]
+            latest_version = self.get_latest_version(package)
+            if latest_version and parse_version(latest_version) > parse_version(current_version):
+                packages_to_update.append((package, current_version, latest_version))
 
-                package, current_version = self._get_package_name_from_spec(parts[0]), parts[1]
-                latest_version = self.get_latest_version(package)
-                if latest_version and parse_version(latest_version) > parse_version(current_version):
-                    packages_to_update.append((package, current_version, latest_version))
-
-            # --- Handle the two "nothing to do" scenarios correctly ---
-            if not packages_to_update:
-                if pass_num == 1:
-                    print("\nInitial baseline is already fully up-to-date.")
-                    print("Running a final health check on the baseline for confirmation.")
-                    self._run_final_health_check()
-                else:
-                    print("\nNo further updates are available. The system has successfully converged.")
-                
-                end_group()
-                if progressive_baseline_path.exists(): progressive_baseline_path.unlink()
-                break # This is the correct exit.
-
-            # --- THIS IS THE LOGGING YOU CORRECTLY POINTED OUT WAS MISSING ---
-            packages_to_update.sort(key=lambda p: self._calculate_update_risk(p[0], p[1], p[2]), reverse=True)
-            print("\nPrioritized Update Plan for this Pass:")
-            total_updates_in_plan = len(packages_to_update)
-            for i, (pkg, cur_ver, target_ver) in enumerate(packages_to_update):
-                score = self._calculate_update_risk(pkg, cur_ver, target_ver)
-                print(f"  {i+1}/{total_updates_in_plan}: {pkg} (Risk: {score:.2f}) -> {target_ver}")
-            # --- END OF FIX ---
-            
-            # --- The Main Healing and Update Loop ---
-            for i, (package, current_ver, target_ver) in enumerate(packages_to_update):
-                # The PULSE log provides a clear, narrative structure.
-                print(f"\n" + "-"*80); print(f"PULSE: [PASS {pass_num} | ATTEMPT {i+1}/{total_updates_in_plan}] Processing '{package}'"); print(f"PULSE: Changed packages this pass so far: {changed_packages_this_pass}"); print("-"*80)
-                
-                success, reason, _ = self.attempt_update_with_healing(
-                    package, current_ver, target_ver, [], 
-                    progressive_baseline_path, # ALWAYS uses the "living document"
-                    changed_packages_this_pass
-                )
-                
-                if success:
-                    final_successful_updates[package] = (target_ver, reason)
-                    if current_ver != reason:
-                        changed_packages_this_pass.add(package)
-                        
-                        # YOUR FIX: UPDATE THE BASELINE IN-PLACE FOR THE NEXT ATTEMPT
-                        print(f"  -> SUCCESS. Locking in {package}=={reason} into the progressive baseline for this pass.")
-                        with open(progressive_baseline_path, "r") as f:
-                            temp_lines = f.readlines()
-                        with open(progressive_baseline_path, "w") as f:
-                            for line in temp_lines:
-                                if self._get_package_name_from_spec(line.split(';')[0]) == package:
-                                    marker_part = ""
-                                    if ";" in line:
-                                        marker_part = " ;" + line.split(";", 1)[1]
-                                    f.write(f"{package}=={reason}{marker_part}\n")
-                                else:
-                                    f.write(line)
-                else:
-                    final_failed_updates[package] = (target_ver, reason)
+        # --- Handle the two "nothing to do" scenarios correctly ---
+        if not packages_to_update:
+            if pass_num == 1:
+                print("\nInitial baseline is already fully up-to-date.")
+                print("Running a final health check on the baseline for confirmation.")
+                self._run_final_health_check()
+            else:
+                print("\nNo further updates are available. The system has successfully converged.")
             
             end_group()
+            if progressive_baseline_path.exists(): progressive_baseline_path.unlink()
+            break 
 
-            # --- Promote the "living document" to the new Golden Record ---
-            if changed_packages_this_pass:
-                print("\nPass complete with changes. Promoting the progressive baseline to the new Golden Record.")
-                shutil.copy(progressive_baseline_path, self.requirements_path)
-            
-            if progressive_baseline_path.exists():
-                progressive_baseline_path.unlink()
-
-            # The final convergence check.
-            if not changed_packages_this_pass:
-                print("\nNo effective version changes were possible in this pass. The system has converged.")
-                break
+        packages_to_update.sort(key=lambda p: self._calculate_update_risk(p[0], p[1], p[2]), reverse=True)
+        print("\nPrioritized Update Plan for this Pass:")
+        total_updates_in_plan = len(packages_to_update)
+        for i, (pkg, cur_ver, target_ver) in enumerate(packages_to_update):
+            score = self._calculate_update_risk(pkg, cur_ver, target_ver)
+            print(f"  {i+1}/{total_updates_in_plan}: {pkg} (Risk: {score:.2f}) -> {target_ver}")
         
-        # This part now only runs if updates were actually made.
-        if final_successful_updates:
-            self._print_final_summary(final_successful_updates, final_failed_updates)
-            self._run_final_health_check()
+        # --- The Main Healing and Update Loop ---
+        for i, (package, current_ver, target_ver) in enumerate(packages_to_update):
+            print(f"\n" + "-"*80); print(f"PULSE: [PASS {pass_num} | ATTEMPT {i+1}/{total_updates_in_plan}] Processing '{package}'"); print(f"PULSE: Changed packages this pass so far: {changed_packages_this_pass}"); print("-"*80)
+            
+            # The call no longer passes `changed_packages_this_pass`
+            success, reason_or_new_version, _ = self.attempt_update_with_healing(
+                package, current_ver, target_ver, [], 
+                progressive_baseline_path
+            )
+            
+            if success:
+                # --- START OF CORRECTED LOGIC ---
+                
+                # Determine the actual version that was reached and if a real change occurred.
+                reached_version = ""
+                is_a_real_change = False
+
+                if "skipped" in str(reason_or_new_version):
+                    # This is the optimization case: validation was skipped because there was no version change.
+                    reached_version = current_ver
+                    is_a_real_change = False
+                else:
+                    # An update attempt was made. The new version is in the return variable.
+                    reached_version = reason_or_new_version
+                    # A real change only happens if the version number is actually different.
+                    if current_ver != reached_version:
+                        is_a_real_change = True
+                
+                # Use our clean variables for accurate reporting and state management.
+                final_successful_updates[package] = (target_ver, reached_version)
+                
+                if is_a_real_change:
+                    changed_packages_this_pass.add(package)
+                    
+                    # Update the "living document" for the next attempt in this pass.
+                    print(f"  -> SUCCESS. Locking in {package}=={reached_version} into the progressive baseline for this pass.")
+                    with open(progressive_baseline_path, "r") as f:
+                        temp_lines = f.readlines()
+                    with open(progressive_baseline_path, "w") as f:
+                        for line in temp_lines:
+                            if self._get_package_name_from_spec(line.split(';')[0]) == package:
+                                marker_part = ""
+                                if ";" in line:
+                                    marker_part = " ;" + line.split(";", 1)[1]
+                                f.write(f"{package}=={reached_version}{marker_part}\n")
+                            else:
+                                f.write(line)
+                
+                # --- END OF CORRECTED LOGIC ---
+
+            else: # if success is False
+                final_failed_updates[package] = (target_ver, reason_or_new_version)
+        
+        end_group()
+
+        # --- Promote the "living document" to the new Golden Record ---
+        if changed_packages_this_pass:
+            print("\nPass complete with changes")
+            shutil.copy(progressive_baseline_path, self.requirements_path)
+        
+        if progressive_baseline_path.exists():
+            progressive_baseline_path.unlink()
+
+        # The final convergence check.
+        if not changed_packages_this_pass:
+            print("\nNo effective version changes were possible in this pass. The system has converged.")
+            break
+    
+    if final_successful_updates:
+        self._print_final_summary(final_successful_updates, final_failed_updates)
+        self._run_final_health_check()
 
     def _apply_pass_updates(self, successful_updates, baseline_reqs_path):
         """
@@ -348,92 +367,108 @@ class DependencyAgent:
             return max(stable_versions, key=parse_version) if stable_versions else max([p.version for p in package_info.packages if p.version], key=parse_version)
         except Exception: return None
 
-    def _try_install_and_validate(self, package_to_update, new_version, dynamic_constraints, baseline_reqs_path, is_probe, changed_packages):
-        """
-        Creates a temporary environment to test a single package update.
-        It runs a robust installation and then proceeds to validation.
-        """
-        venv_dir = Path("./temp_venv")
-        if venv_dir.exists(): shutil.rmtree(venv_dir)
-        venv.create(venv_dir, with_pip=True)
-        python_executable = str((venv_dir / "bin" / "python").resolve())
-        
-        temp_reqs_path = venv_dir / "temp_requirements.txt"
-        
-        # Create the temporary, modified requirements file for this specific test run.
-        with open(baseline_reqs_path, "r") as f_read, open(temp_reqs_path, "w") as f_write:
-            # We must handle environment markers correctly here by only changing the version part.
-            lines_for_file = []
-            for line in f_read:
-                line = line.strip()
-                if not line or line.startswith('#'): continue
-                
-                package_part = line.split(';')[0].strip()
-                
-                if self._get_package_name_from_spec(package_part) == package_to_update:
-                    # Preserve the marker if it exists, but update the version.
-                    marker_part = ""
-                    if ";" in line:
-                        marker_part = " ;" + line.split(";", 1)[1]
-                    lines_for_file.append(f"{package_to_update}=={new_version}{marker_part}")
-                else:
-                    lines_for_file.append(line)
+    # In agent_logic.py
 
-            # We also need to add dynamic constraints, though we are not currently using them.
-            for constraint in dynamic_constraints:
-                 if self._get_package_name_from_spec(constraint) != package_to_update:
-                    lines_for_file.append(constraint)
-
-            f_write.write("\n".join(lines_for_file))
-        old_version = "N/A"
+def _try_install_and_validate(self, package_to_update, new_version, dynamic_constraints, baseline_reqs_path, is_probe):
+    """
+    Creates a temporary environment to test a single package update.
+    It runs a robust installation and then proceeds to validation.
+    This version includes an optimization to skip redundant validation runs.
+    """
+    venv_dir = Path("./temp_venv")
+    if venv_dir.exists(): shutil.rmtree(venv_dir)
+    venv.create(venv_dir, with_pip=True)
+    python_executable = str((venv_dir / "bin" / "python").resolve())
+    
+    # Determine the 'old_version' from the current progressive baseline for comparison.
+    old_version = "N/A"
+    with open(baseline_reqs_path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#'): continue
+            # Ensure we're checking the correct package, ignoring markers
+            if self._get_package_name_from_spec(line.split(';')[0]) == package_to_update:
+                if '==' in line:
+                    old_version = line.split(';')[0].strip().split('==')[1]
+                    break
+    
+    # --- START OF OPTIMIZATION LOGIC ---
+    # If the new version is the same as the old version in the baseline,
+    # it means no change is being made. The environment state is identical to the
+    # last known-good state, so we can skip the expensive validation step.
+    if new_version == old_version:
+        # We only print the verbose analysis if it's not a quick probe from the backtrack algorithm
         if not is_probe:
-            with open(baseline_reqs_path, "r") as f:
-                for line in f:
-                    if self._get_package_name_from_spec(line) == package_to_update:
-                        if '==' in line: old_version = line.split(';')[0].strip().split('==')[1]
-            print(f"\nChange analysis: Updating '{package_to_update}' from {old_version} -> {new_version}")
-
-        # --- STEP 1: The Reliable, Robust Install Attempt ---
-        _, stderr_install, returncode = run_command([python_executable, "-m", "pip", "install", "-r", str(temp_reqs_path)])
-        
-        # --- STEP 2: The Diagnostic Phase (if Step 1 failed) ---
-        if returncode != 0:
-            print("INFO: Main installation failed. Retrying with verbose logging to identify conflicting packages...")
-            
-            # The "Diagnostic Retry": Rerun with command-line args to get a better error.
-            with open(temp_reqs_path, 'r') as f:
-                requirements_list_for_log = [line.strip() for line in f if line.strip()]
-            pip_command_for_logs = [python_executable, "-m", "pip", "install"] + requirements_list_for_log
-            _, stderr_for_logs, _ = run_command(pip_command_for_logs)
-            
-            # Primary Method: A robust regex to parse the human-readable conflict.
-            conflict_match = re.search(r"Cannot install(?P<packages>[\s\S]+?)because", stderr_for_logs)
-            
-            reason = ""
-            if conflict_match:
-                conflicting_packages = ' '.join(conflict_match.group('packages').split())
-                conflicting_packages = conflicting_packages.replace(' and ', ', ').replace(',', ', ')
-                reason = f"Conflict between packages: {conflicting_packages}"
-                print(f"DIAGNOSIS: {reason}")
-            else:
-                # Fallback Method: If regex fails, use the LLM to summarize.
-                print("DIAGNOSIS: Could not parse specific conflicts. Falling back to LLM summary.")
-                llm_summary = self._ask_llm_to_summarize_error(stderr_install)
-                reason = f"Installation conflict. Summary: {llm_summary}"
-            
-            return False, reason, stderr_install
-        
-        # The crucial check to skip redundant validation runs.
-        if new_version == old_version and not changed_packages:
+             print(f"--> Change analysis: '{package_to_update}' version remains at {old_version}.")
              print("--> Validation skipped (no change).")
-             return True, "Validation skipped (no change)", ""
+        # Return True because staying at the current version is a successful and valid outcome.
+        # The special string in the 'reason' field signals to the caller that no update was made.
+        return True, "Validation skipped (no change)", ""
 
-        group_title = f"Validation for {package_to_update}=={new_version}"
-        success, metrics, validation_output = validate_changes(python_executable, self.config, group_title=group_title)
+    if not is_probe:
+        print(f"\nChange analysis: Updating '{package_to_update}' from {old_version} -> {new_version}. Validation is required.")
+    # --- END OF OPTIMIZATION LOGIC ---
 
-        if not success:
-            return False, "Validation script failed", validation_output
-        return True, metrics, ""
+    temp_reqs_path = venv_dir / "temp_requirements.txt"
+    
+    # Create the temporary, modified requirements file for this specific test run.
+    with open(baseline_reqs_path, "r") as f_read, open(temp_reqs_path, "w") as f_write:
+        lines_for_file = []
+        for line in f_read:
+            line = line.strip()
+            if not line or line.startswith('#'): continue
+            
+            package_part = line.split(';')[0].strip()
+            
+            if self._get_package_name_from_spec(package_part) == package_to_update:
+                marker_part = ""
+                if ";" in line:
+                    marker_part = " ;" + line.split(";", 1)[1]
+                lines_for_file.append(f"{package_to_update}=={new_version}{marker_part}")
+            else:
+                lines_for_file.append(line)
+
+        for constraint in dynamic_constraints:
+             if self._get_package_name_from_spec(constraint) != package_to_update:
+                lines_for_file.append(constraint)
+
+        f_write.write("\n".join(lines_for_file))
+
+    # --- STEP 1: The Reliable, Robust Install Attempt ---
+    _, stderr_install, returncode = run_command([python_executable, "-m", "pip", "install", "-r", str(temp_reqs_path)])
+    
+    # --- STEP 2: The Diagnostic Phase (if Step 1 failed) ---
+    if returncode != 0:
+        print("INFO: Main installation failed. Retrying with verbose logging to identify conflicting packages...")
+        
+        with open(temp_reqs_path, 'r') as f:
+            requirements_list_for_log = [line.strip() for line in f if line.strip()]
+        pip_command_for_logs = [python_executable, "-m", "pip", "install"] + requirements_list_for_log
+        _, stderr_for_logs, _ = run_command(pip_command_for_logs)
+        
+        conflict_match = re.search(r"Cannot install(?P<packages>[\s\S]+?)because", stderr_for_logs)
+        
+        reason = ""
+        if conflict_match:
+            conflicting_packages = ' '.join(conflict_match.group('packages').split())
+            conflicting_packages = conflicting_packages.replace(' and ', ', ').replace(',', ', ')
+            reason = f"Conflict between packages: {conflicting_packages}"
+            print(f"DIAGNOSIS: {reason}")
+        else:
+            print("DIAGNOSIS: Could not parse specific conflicts. Falling back to LLM summary.")
+            llm_summary = self._ask_llm_to_summarize_error(stderr_install)
+            reason = f"Installation conflict. Summary: {llm_summary}"
+        
+        return False, reason, stderr_install
+    
+    # --- STEP 3: Validation of the new environment ---
+    group_title = f"Validation for {package_to_update}=={new_version}"
+    success, metrics, validation_output = validate_changes(python_executable, self.config, group_title=group_title)
+
+    if not success:
+        return False, "Validation script failed", validation_output
+    
+    return True, metrics, ""
     
 
     def attempt_update_with_healing(self, package, current_version, target_version, dynamic_constraints, baseline_reqs_path, changed_packages_this_pass):
