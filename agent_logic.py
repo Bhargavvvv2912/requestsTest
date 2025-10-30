@@ -406,7 +406,7 @@ class DependencyAgent:
             return True, "Validation skipped (no change)", ""
 
         if not is_probe:
-            print(f"\nChange analysis: Updating '{package_to_update}' from {old_version} -> {new_version}. Validation is required.")
+            print(f"\nChange analysis: Updating '{package_to_update}' from {old_version} -> {new_version}")
         # --- END OF OPTIMIZATION LOGIC ---
 
         temp_reqs_path = venv_dir / "temp_requirements.txt"
