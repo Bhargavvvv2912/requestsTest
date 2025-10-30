@@ -471,7 +471,9 @@ class DependencyAgent:
         return True, metrics, ""
     
 
-    def attempt_update_with_healing(self, package, current_version, target_version, dynamic_constraints, baseline_reqs_path, changed_packages_this_pass):
+    # In agent_logic.py
+
+    def attempt_update_with_healing(self, package, current_version, target_version, dynamic_constraints, baseline_reqs_path):
         """
         Attempts to update a package and intelligently chooses a healing strategy
         based on the type of failure (Installation vs. Validation).
@@ -479,17 +481,18 @@ class DependencyAgent:
         """
         print(f"\nAttempting to validate {package}=={target_version}...")
         
+        # The `is_probe` argument is False for this initial, direct attempt.
         success, result_data, stderr = self._try_install_and_validate(
             package, target_version, dynamic_constraints, baseline_reqs_path, 
-            is_probe=False, changed_packages=changed_packages_this_pass
+            is_probe=False
         )
         
         if success:
             print(f"Direct update to {package}=={target_version} succeeded.")
+            # The 'result_data' will either be metrics or our "skipped" message.
+            # We pass it up to the run() method to decide the actual new version.
             return True, result_data if "skipped" in str(result_data) else target_version, None
 
-        # --- THIS IS THE CORRECTED TRIAGE LOGIC ---
-        # We determine the failure type based on the content of the "reason" string.
         failure_type = "ValidationConflict" if "Validation script failed" in str(result_data) else "InstallationConflict"
         
         print(f"\nINFO: Initial update for '{package}' failed. Reason: '{result_data}'")
@@ -502,13 +505,13 @@ class DependencyAgent:
             print("  -> Strategy: Using LLM-first approach with binary search fallback.")
             healed_version = self._heal_with_llm_first(
                 package, current_version, target_version, dynamic_constraints, 
-                baseline_reqs_path, changed_packages_this_pass, stderr  # Correctly passing stderr
+                baseline_reqs_path, stderr  # No longer passes changed_packages
             )
         else: # ValidationConflict
             print("  -> Strategy: Using binary search backtrack for runtime/validation failure.")
             healed_version = self._intelligent_backtrack(
                 package, current_version, target_version, dynamic_constraints, 
-                baseline_reqs_path, changed_packages_this_pass
+                baseline_reqs_path  # No longer passes changed_packages
             )
 
         if healed_version:
@@ -517,21 +520,22 @@ class DependencyAgent:
         return False, f"All healing attempts for {package} failed.", None
     
 
-    def _intelligent_backtrack(self, package, last_good_version, failed_version, dynamic_constraints, baseline_reqs_path, changed_packages):
+    # In agent_logic.py
+
+    def _intelligent_backtrack(self, package, last_good_version, failed_version, dynamic_constraints, baseline_reqs_path):
         start_group(f"Healing Backtrack for {package} (Intelligent Bisection Search)")
         
         versions = self.get_all_versions_between(package, last_good_version, failed_version)
         
-        # Use a class member to store the best version found across all recursive calls.
         self.best_working_version = last_good_version
         
         if not versions:
             print("Intelligent Search: No intermediate versions to test.")
+            end_group()
             return self.best_working_version
 
         print(f"Intelligent Search: Searching {len(versions)} versions using Backtracking Bisection...")
         
-        # --- YOUR BRILLIANT RECURSIVE ALGORITHM ---
         def search(sub_list):
             if not sub_list:
                 return
@@ -544,22 +548,19 @@ class DependencyAgent:
             self.tested_versions.add(test_version)
 
             print(f"  -> Probing version {test_version}...")
+            # Call to _try_install_and_validate is now simpler. is_probe is True.
             success, reason, _ = self._try_install_and_validate(
-                package, test_version, dynamic_constraints, baseline_reqs_path, True, changed_packages
+                package, test_version, dynamic_constraints, baseline_reqs_path, is_probe=True
             )
             
             if success:
                 print(f"  -- SUCCESS: Version {test_version} is a new candidate.")
                 if parse_version(test_version) > parse_version(self.best_working_version):
                     self.best_working_version = test_version
-                
-                # YOUR INSIGHT: Aggressively search the newer half, discard the left.
                 search(sub_list[mid_index + 1:])
             else:
                 print(f"  -- FAILURE: Version {test_version} failed. Reason: {reason}")
-                # First, aggressively check the newer half for islands.
                 search(sub_list[mid_index + 1:])
-                # Then, backtrack to the older half.
                 search(sub_list[:mid_index])
 
         self.tested_versions = set()
@@ -592,18 +593,18 @@ class DependencyAgent:
         lines = freeze_output.strip().split('\n')
         return "\n".join([line for line in lines if '==' in line and not line.startswith('-e')])
 
-    def _heal_with_llm_first(self, package, current_version, target_version, dynamic_constraints, baseline_reqs_path, changed_packages, error_log):
+    # In agent_logic.py
+
+    def _heal_with_llm_first(self, package, current_version, target_version, dynamic_constraints, baseline_reqs_path, error_log):
         """
-        Implements your "Conversational Correction" loop with a "Reality Check".
-        It tries to get a valid suggestion from the LLM, verifies it against PyPI,
-        and then falls back to the definitive intelligent backtrack.
+        Implements the "Conversational Correction" loop with a "Reality Check".
         """
         print("  -> Phase 1: Collaborating with LLM for intelligent version candidates.")
         
         all_real_versions = self._get_all_available_versions(package)
         if not all_real_versions:
             print("  -> LLM SKIPPED: Could not retrieve any available versions from PyPI.")
-            return self._intelligent_backtrack(package, current_version, target_version, dynamic_constraints, baseline_reqs_path, changed_packages)
+            return self._intelligent_backtrack(package, current_version, target_version, dynamic_constraints, baseline_reqs_path)
 
         verified_candidates = []
         conversation_history = []
@@ -611,9 +612,7 @@ class DependencyAgent:
             suggestions = self._ask_llm_for_install_candidates(
                 package, current_version, target_version, error_log, baseline_reqs_path, conversation_history
             )
-            
             verified_candidates = [v for v in suggestions if v in all_real_versions]
-            
             if verified_candidates:
                 break
             else:
@@ -629,8 +628,9 @@ class DependencyAgent:
                     continue
                 
                 print(f"  -> Attempting VERIFIED LLM suggestion: {package}=={candidate}")
+                # The call is now simpler. is_probe is False.
                 success, _, _ = self._try_install_and_validate(
-                    package, candidate, dynamic_constraints, baseline_reqs_path, False, changed_packages
+                    package, candidate, dynamic_constraints, baseline_reqs_path, is_probe=False
                 )
                 if success:
                     print(f"  -> SUCCESS: LLM-suggested version {candidate} was correct.")
@@ -638,7 +638,7 @@ class DependencyAgent:
         
         print("  -> Phase 2: LLM collaboration failed. Falling back to the definitive Intelligent Backtrack search.")
         return self._intelligent_backtrack(
-            package, current_version, target_version, dynamic_constraints, baseline_reqs_path, changed_packages
+            package, current_version, target_version, dynamic_constraints, baseline_reqs_path
         )
 
     def _ask_llm_for_install_candidates(self, package, current_version, failed_version, error_message, baseline_reqs_path, conversation_history):
