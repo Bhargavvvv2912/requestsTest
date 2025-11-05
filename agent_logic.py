@@ -1,3 +1,5 @@
+# agent_logic.py
+
 import os
 import sys
 import venv
@@ -119,8 +121,7 @@ class DependencyAgent:
             if not is_pinned:
                 sys.exit("CRITICAL: Bootstrap process failed to produce a fully pinned requirements file.")
 
-        final_successful_updates = {}
-        final_failed_updates = {}
+        final_successful_updates, final_failed_updates = {}, {}
         pass_num = 0
         
         while pass_num < self.config["MAX_RUN_PASSES"]:
@@ -129,7 +130,6 @@ class DependencyAgent:
             
             progressive_baseline_path = Path(f"./pass_{pass_num}_progressive_reqs.txt")
             shutil.copy(self.requirements_path, progressive_baseline_path)
-            
             changed_packages_this_pass = set()
 
             packages_to_update = []
@@ -147,24 +147,21 @@ class DependencyAgent:
 
             if not packages_to_update:
                 if pass_num == 1:
-                    print("\nInitial baseline is already fully up-to-date.")
-                    print("Running a final health check on the baseline for confirmation.")
+                    print("\nInitial baseline is already fully up-to-date. Running a final health check.")
                     self._run_final_health_check()
                 else:
                     print("\nNo further updates are available. The system has successfully converged.")
-                end_group()
                 if progressive_baseline_path.exists(): progressive_baseline_path.unlink()
                 break 
 
             packages_to_update.sort(key=lambda p: self._calculate_update_risk(p[0], p[1], p[2]), reverse=False)
             print("\nPrioritized Update Plan for this Pass (Lowest Risk First):")
-            total_updates_in_plan = len(packages_to_update)
             for i, (pkg, cur_ver, target_ver) in enumerate(packages_to_update):
                 score = self._calculate_update_risk(pkg, cur_ver, target_ver)
-                print(f"  {i+1}/{total_updates_in_plan}: {pkg} (Risk: {score:.2f}) -> {target_ver}")
+                print(f"  {i+1}/{len(packages_to_update)}: {pkg} (Risk: {score:.2f}) -> {target_ver}")
             
             for i, (package, current_ver, target_ver) in enumerate(packages_to_update):
-                print(f"\n" + "-"*80); print(f"PULSE: [PASS {pass_num} | ATTEMPT {i+1}/{total_updates_in_plan}] Processing '{package}'"); print(f"PULSE: Changed packages this pass so far: {changed_packages_this_pass}"); print("-"*80)
+                print(f"\n" + "-"*80); print(f"PULSE: [PASS {pass_num} | ATTEMPT {i+1}/{len(packages_to_update)}] Processing '{package}'"); print(f"PULSE: Changed packages this pass so far: {changed_packages_this_pass}"); print("-"*80)
                 
                 success, reason_or_new_version, _ = self.attempt_update_with_healing(
                     package, current_ver, target_ver, [], progressive_baseline_path
@@ -187,18 +184,16 @@ class DependencyAgent:
                         with open(progressive_baseline_path, "w") as f:
                             for line in temp_lines:
                                 if self._get_package_name_from_spec(line.split(';')[0]) == package:
-                                    marker_part = ""
-                                    if ";" in line: marker_part = " ;" + line.split(";", 1)[1]
+                                    marker_part = f" ;{line.split(';')[1]}" if ';' in line else ""
                                     f.write(f"{package}=={reached_version}{marker_part}\n")
-                                else:
-                                    f.write(line)
+                                else: f.write(line)
                 else:
                     final_failed_updates[package] = (target_ver, reason_or_new_version)
             
             end_group()
 
             if changed_packages_this_pass:
-                print("\nPass complete with changes")
+                print("\nPass complete with changes.")
                 shutil.copy(progressive_baseline_path, self.requirements_path)
             if progressive_baseline_path.exists(): progressive_baseline_path.unlink()
             if not changed_packages_this_pass:
@@ -275,29 +270,37 @@ class DependencyAgent:
         
         if new_version == old_version:
             if not is_probe:
-                print(f"--> Change analysis: '{package_to_update}' version remains at {old_version}.")
-                print("--> Validation skipped (no change).")
+                print(f"--> Change analysis: '{package_to_update}' version remains at {old_version}. Validation skipped.")
             return True, "Validation skipped (no change)", ""
 
         if not is_probe: print(f"\nChange analysis: Updating '{package_to_update}' from {old_version} -> {new_version}")
 
         temp_reqs_path = venv_dir / "temp_requirements.txt"
         with open(baseline_reqs_path, "r") as f_read, open(temp_reqs_path, "w") as f_write:
-            lines = [line.strip() for line in f_read if line.strip() and not line.startswith('#')]
-            found = False
-            for i, line in enumerate(lines):
+            lines_for_file = []
+            for line in f_read:
+                line = line.strip()
+                if not line or line.startswith('#'): continue
                 if self._get_package_name_from_spec(line.split(';')[0]) == package_to_update:
-                    marker = f" ;{line.split(';')[1]}" if ';' in line else ""
-                    lines[i] = f"{package_to_update}=={new_version}{marker}"
-                    found = True
-                    break
-            if not found: lines.append(f"{package_to_update}=={new_version}")
-            f_write.write("\n".join(lines))
+                    marker_part = f" ;{line.split(';')[1]}" if ';' in line else ""
+                    lines_for_file.append(f"{package_to_update}=={new_version}{marker_part}")
+                else: lines_for_file.append(line)
+            f_write.write("\n".join(lines_for_file))
 
         _, stderr_install, returncode = run_command([python_executable, "-m", "pip", "install", "-r", str(temp_reqs_path)])
         
         if returncode != 0:
-            return False, "Installation conflict", stderr_install
+            # THIS IS THE RESTORED DETAILED DIAGNOSTIC LOGIC
+            print("INFO: Main installation failed. Analyzing conflict...")
+            conflict_match = re.search(r"Cannot install(?P<packages>[\s\S]+?)because", stderr_install)
+            reason = ""
+            if conflict_match:
+                conflicting_packages = ' '.join(conflict_match.group('packages').split()).replace(' and ', ', ').replace(',', ', ')
+                reason = f"Installation conflict: {conflicting_packages}"
+                print(f"DIAGNOSIS: {reason}")
+            else:
+                reason = "Installation conflict (Could not parse specific packages)"
+            return False, reason, stderr_install
         
         group_title = f"Validation for {package_to_update}=={new_version}"
         success, metrics, validation_output = validate_changes(python_executable, self.config, group_title=group_title)
@@ -305,8 +308,7 @@ class DependencyAgent:
         if not success:
             return False, "Validation script failed", validation_output
         return True, metrics, ""
-    
-    # In agent_logic.py
+
     def attempt_update_with_healing(self, package, current_version, target_version, dynamic_constraints, baseline_reqs_path):
         print(f"\nAttempting to validate {package}=={target_version}...")
         
@@ -324,25 +326,18 @@ class DependencyAgent:
 
         healed_version = self._heal_with_filter_and_scan(package, current_version, target_version, baseline_reqs_path)
         
-        # --- THIS IS THE CORRECTED LOGIC ---
         if healed_version:
-            # If a version was returned (even if it's the same as the old one), the process was a success.
-            # It's up to the run() method to decide if a change happened.
             return True, healed_version, None
         
-        # This part should ideally never be reached with the new logic, but it's here for safety.
         return False, f"All healing attempts for {package} failed.", None
 
     def _heal_with_filter_and_scan(self, package, last_good_version, failed_version, baseline_reqs_path):
         start_group(f"Healing '{package}' with Filter-Then-Scan")
 
-        # --- Phase 1: The High-Speed Compatibility Filter ---
         print("\n--- Phase 1: Filtering for installable versions ---")
-        
         candidate_versions = self.get_all_versions_between(package, last_good_version, failed_version)
         if not candidate_versions:
-            print("No intermediate versions found to test.")
-            end_group()
+            print("No intermediate versions found to test."); end_group()
             return last_good_version
 
         fixed_constraints = []
@@ -353,38 +348,30 @@ class DependencyAgent:
                     fixed_constraints.append(line)
 
         installable_versions = []
-        # Use a single temporary venv for all dry-run checks for speed
         venv_dir = Path("./temp_pip_check")
         if venv_dir.exists(): shutil.rmtree(venv_dir)
         venv.create(venv_dir, with_pip=True)
         python_executable = str((venv_dir / "bin" / "python").resolve())
         
-        for version in reversed(candidate_versions): # Start from the newest
+        for version in reversed(candidate_versions):
             print(f"  -> Checking installability of {package}=={version}...")
             temp_reqs_for_check = fixed_constraints + [f"{package}=={version}"]
-            
-            # Write to a temporary file for pip to read
             temp_reqs_path = venv_dir / "check_reqs.txt"
-            with open(temp_reqs_path, "w") as f:
-                f.write("\n".join(temp_reqs_for_check))
-
+            with open(temp_reqs_path, "w") as f: f.write("\n".join(temp_reqs_for_check))
             pip_command = [python_executable, "-m", "pip", "install", "--dry-run", "--quiet", "-r", str(temp_reqs_path)]
             _, _, returncode = run_command(pip_command)
-
             if returncode == 0:
                 print(f"     -- OK: {package}=={version} is installable.")
                 installable_versions.append(version)
         
         if venv_dir.exists(): shutil.rmtree(venv_dir)
 
-        # --- Phase 2: The Linear Validation Scan ---
         print("\n--- Phase 2: Validating installable versions (newest first) ---")
         if not installable_versions:
-            print("No installable versions found in the given range. The best version is the last good one.")
-            end_group()
+            print("No installable versions found in range."); end_group()
             return last_good_version
 
-        for version_to_test in installable_versions: # Already sorted newest to oldest
+        for version_to_test in installable_versions:
             print(f"  -> Validating {package}=={version_to_test}...")
             success, _, _ = self._try_install_and_validate(
                 package, version_to_test, [], baseline_reqs_path, is_probe=True
@@ -394,8 +381,7 @@ class DependencyAgent:
                 end_group()
                 return version_to_test
         
-        print("\nINFO: No installable version passed validation. The best version is the last good one.")
-        end_group()
+        print("\nINFO: No installable version passed validation."); end_group()
         return last_good_version
 
     def get_all_versions_between(self, package_name, start_ver_str, end_ver_str):
@@ -404,29 +390,10 @@ class DependencyAgent:
             if not (package_info and package_info.packages): return []
             start_v, end_v = parse_version(start_ver_str), parse_version(end_ver_str)
             all_versions = {p.version for p in package_info.packages if p.version and not parse_version(p.version).is_prerelease}
-            
-            candidate_versions = [v_str for v_str in all_versions if start_v < parse_version(v_str) < end_v]
-            
+            candidate_versions = [v_str for v_str in all_versions if start_v < parse_version(v_str) <= end_v]
             return sorted(candidate_versions, key=parse_version)
         except Exception: return []
 
-    def _ask_llm_to_summarize_error(self, error_message):
-        if not self.llm_available: return "(LLM unavailable due to quota)"
-        prompt = f"The following is a Python pip install error log. Please summarize the root cause of the conflict in a single, concise sentence. Error Log: --- {error_message} ---"
-        try:
-            response = self.llm.generate_content(prompt)
-            return response.text.strip().replace('\n', ' ')
-        except Exception: return "Failed to get summary from LLM."
-            
     def _prune_pip_freeze(self, freeze_output):
         lines = freeze_output.strip().split('\n')
         return "\n".join([line for line in lines if '==' in line and not line.startswith('-e')])
-        
-    def _get_all_available_versions(self, package_name: str) -> set[str]:
-        try:
-            page = self.pypi.get_project_page(package_name)
-            if not (page and page.packages): return set()
-            versions = {p.version for p in page.packages if p.version and not parse_version(p.version).is_prerelease}
-            return versions
-        except Exception:
-            return set()
