@@ -45,6 +45,18 @@ jobs:
         run: python dependency_agent.py
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+
+      # --- ADD THIS NEW STEP ---
+      - name: Configure git to ignore temporary directories
+        run: |
+          echo "Configuring git to ignore agent artifacts for this run..."
+          # Create a git exclude file for this run
+          echo "/temp_venv/" >> .git/info/exclude
+          echo "/final_venv/" >> .git/info/exclude
+          echo "/bootstrap_venv/" >> .git/info/exclude
+          echo "/temp_pip_check/" >> .git/info/exclude
+          echo "/requests/" >> .git/info/exclude
+      # --- END OF NEW STEP ---
       
       - name: Commit and push changes if any
         run: |
