@@ -304,9 +304,6 @@ class DependencyAgent:
             return max(stable_versions, key=parse_version) if stable_versions else max([p.version for p in package_info.packages if p.version], key=parse_version)
         except Exception: return None
 
-
-    # In agent_logic.py
-
     def _try_install_and_validate(self, package_to_update, new_version, dynamic_constraints, baseline_reqs_path, is_probe):
         start_group(f"Probe: Attempting install & validation for {package_to_update}=={new_version}")
         
@@ -390,17 +387,24 @@ class DependencyAgent:
             print(f"--> Toplevel Result: Direct update to {package}=={target_version} SUCCEEDED.")
             return True, result_data if "skipped" in str(result_data) else target_version, None
 
+        # --- This is the corrected, simpler flow ---
         print(f"\n--> Toplevel Result: Direct update FAILED. Reason: '{result_data}'")
-        # The full error log is now inside the probe's collapsible group, so we don't need another one.
         print("--> Action: Entering healing mode with 'Filter-Then-Scan' strategy.")
 
-        healed_version = self._heal_with_filter_and_scan(package, current_version, target_version, baseline_reqs_path)
+        # The call is now simple again. It doesn't need the extra parameter.
+        healed_version = self._heal_with_filter_and_scan(
+            package, current_version, target_version, baseline_reqs_path
+        )
         
-        if healed_version:
-            return True, healed_version, None
+        if healed_version and healed_version != current_version:
+             print(f"--> Healing Result: A new working version was found for '{package}': {healed_version}")
+             return True, healed_version, None
+        else:
+             # This is the message for when no better version is found.
+             print(f"--> Healing Result: No newer, compatible, and working version of '{package}' was found. Reverting to {current_version}.")
+             # We return success=True and the original version, because staying put is a valid resolution.
+             return True, current_version, None
         
-        return False, f"All healing attempts for {package} failed.", None
-
     def _heal_with_filter_and_scan(self, package, last_good_version, failed_version, baseline_reqs_path):
         start_group(f"Healing '{package}': Filter-Then-Scan Strategy")
 
@@ -429,29 +433,29 @@ class DependencyAgent:
             requirements_list_for_check = fixed_constraints + [f"{package}=={version}"]
             pip_command = [python_executable, "-m", "pip", "install", "--dry-run"] + requirements_list_for_check
             
-            # --- START OF CHANGE ---
-            # We now set display_command=False to suppress the noisy log line
             _, stderr, returncode = run_command(pip_command, display_command=False)
-            # --- END OF CHANGE ---
 
             if returncode == 0:
-                print(f"     -- [ OK ] Compatible.")
+                print(f"     -- Compatible.")
                 installable_versions.append(version)
             else:
+                # --- START OF NEW, CONTEXTUAL LOGGING ---
                 summary = self._ask_llm_to_summarize_error(stderr)
-                print(f"     -- [ XX ] Incompatible. Reason: {summary}")
+                # This new log format is much clearer
+                print(f"     -- Incompatible. The attempt to add this version revealed an underlying conflict.")
+                print(f"        Diagnosis: {summary}")
+                # --- END OF NEW, CONTEXTUAL LOGGING ---
         
         if venv_dir.exists(): shutil.rmtree(venv_dir)
 
         # --- Phase 2: The Linear Validation Scan ---
         print("\n--- Phase 2: Validating compatible versions (newest first) ---")
         if not installable_versions:
-            print("Result: No compatible versions found in the given range. Reverting to last known good version.")
+            print("Result: No compatible versions were found. Reverting to last known good version.")
             end_group()
             return last_good_version
         
-        print(f"Found {len(installable_versions)} compatible versions to test:")
-        print(f"  -> {installable_versions}")
+        print(f"Found {len(installable_versions)} compatible versions to test: {installable_versions}")
 
         for version_to_test in installable_versions:
             success, _, _ = self._try_install_and_validate(
