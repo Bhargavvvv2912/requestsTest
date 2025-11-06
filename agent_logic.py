@@ -304,7 +304,6 @@ class DependencyAgent:
             return max(stable_versions, key=parse_version) if stable_versions else max([p.version for p in package_info.packages if p.version], key=parse_version)
         except Exception: return None
 
-    # In agent_logic.py
 
     def _try_install_and_validate(self, package_to_update, new_version, dynamic_constraints, baseline_reqs_path, is_probe):
         venv_dir = Path("./temp_venv")
@@ -338,39 +337,66 @@ class DependencyAgent:
                 else: lines_for_file.append(line)
             f_write.write("\n".join(lines_for_file))
 
+        # --- Stage 1: The Initial Install Attempt ---
         _, stderr_install, returncode = run_command([python_executable, "-m", "pip", "install", "-r", str(temp_reqs_path)])
         
         if returncode != 0:
-            # --- START OF IMPROVED DIAGNOSTIC LOGIC ---
-            print("INFO: Main installation failed. Analyzing conflict...")
+            # --- START OF NEW, ROBUST DIAGNOSTIC PROCESS ---
+            print("INFO: Main installation failed. Re-running with verbose logging for detailed analysis...")
+
+            # --- Stage 2: The "Verbose Re-run" for Diagnostics ---
+            verbose_command = [python_executable, "-m", "pip", "install", "--verbose", "-r", str(temp_reqs_path)]
+            _, verbose_stderr, _ = run_command(verbose_command)
+
+            # --- Stage 3: Robust Parsing ---
+            # This regex looks for pip's detailed "User-provided" vs "Installed" dependency breakdown.
+            conflict_match = re.search(
+                r"\(from versions: .*\)\s*Found link[^,]+, version (?P<version_found>[^\s]+)", 
+                verbose_stderr, 
+                re.MULTILINE
+            )
             
-            # This regex is now more robust and specifically looks for package names.
-            conflict_match = re.search(r"because these package versions have conflicting dependencies.\s*([\s\S]*)The conflict is caused by:", stderr_install, re.MULTILINE)
-            
-            reason = "Installation conflict" # Default reason
+            reason = "Installation conflict" # Default
             if conflict_match:
-                try:
-                    # Extract the lines describing the conflict
-                    conflict_lines = conflict_match.group(1).strip().split('\n')
-                    packages_involved = [line.split(' ')[0].strip() for line in conflict_lines if line.strip()]
-                    reason = f"Installation conflict involving: {', '.join(packages_involved)}"
-                    print(f"DIAGNOSIS: {reason}")
-                except Exception:
-                    print("DIAGNOSIS: Could not parse specific conflicts. Falling back to LLM summary.")
-                    reason = self._ask_llm_to_summarize_error(stderr_install)
+                 # This is a much more robust way to find the actual conflicting package.
+                 # We look for what pip *would* install if it could.
+                 try:
+                    lines = verbose_stderr.split('\n')
+                    conflicting_package_line = ""
+                    for i, line in enumerate(lines):
+                        if "because these package versions have conflicting dependencies" in line:
+                            # The lines immediately following this error usually contain the root cause.
+                            conflicting_package_line = lines[i+2] if i + 2 < len(lines) else ""
+                            break
+                    
+                    if conflicting_package_line and "requires" in conflicting_package_line:
+                        # Example: "sqlalchemy 2.0.0 requires greenlet!=1.1.3"
+                        parts = conflicting_package_line.strip().split(" requires ")
+                        root_cause_package = parts[0]
+                        constraint = parts[1]
+                        reason = f"Installation conflict: {root_cause_package} requires {constraint}"
+                        print(f"DIAGNOSIS: {reason}")
+                    else:
+                        raise ValueError("Could not parse root cause line.")
+
+                 except Exception:
+                    print("DIAGNOSIS: Could not parse specific root cause. Falling back to LLM summary on verbose log.")
+                    reason = self._ask_llm_to_summarize_error(verbose_stderr)
             else:
-                # Fallback if the primary regex fails
-                print("DIAGNOSIS: Could not parse conflict details directly. Falling back to LLM summary.")
+                # --- Stage 4: LLM Summarization as a Fallback ---
+                print("DIAGNOSIS: Verbose log parsing failed. Falling back to LLM summary on original log.")
                 reason = self._ask_llm_to_summarize_error(stderr_install)
 
-            return False, reason, stderr_install       
+            return False, reason, verbose_stderr # Return the richer verbose error log
+            # --- END OF NEW, ROBUST DIAGNOSTIC PROCESS ---
+        
         group_title = f"Validation for {package_to_update}=={new_version}"
         success, metrics, validation_output = validate_changes(python_executable, self.config, group_title=group_title)
 
         if not success:
             return False, "Validation script failed", validation_output
         return True, metrics, ""
-
+    
     def attempt_update_with_healing(self, package, current_version, target_version, dynamic_constraints, baseline_reqs_path):
         print(f"\nAttempting to validate {package}=={target_version}...")
         
