@@ -137,7 +137,7 @@ class DependencyAgent:
         installed_packages, _, _ = run_command([python_executable, "-m", "pip", "freeze"])
         return True, {"metrics": metrics, "packages": self._prune_pip_freeze(installed_packages)}, None
 
-    # In agent_logic.py
+   # In agent_logic.py
 
     def run(self):
         if os.path.exists(self.config["METRICS_OUTPUT_FILE"]):
@@ -153,13 +153,9 @@ class DependencyAgent:
         final_successful_updates, final_failed_updates = {}, {}
         pass_num = 0
         
-        # --- Placeholder for dependency graph parsing ---
-        # For HURM 4.0, you would run `pipdeptree --json-tree` here on the initial
-        # environment and parse the output into self.dependency_graph_metrics.
         if not hasattr(self, 'dependency_graph_metrics'):
             print("INFO: Dependency graph metrics not found. Entanglement scores will be 0.")
             self.dependency_graph_metrics = {}
-        # --- End of placeholder ---
 
         while pass_num < self.config["MAX_RUN_PASSES"]:
             pass_num += 1
@@ -191,7 +187,7 @@ class DependencyAgent:
                 if progressive_baseline_path.exists(): progressive_baseline_path.unlink()
                 break 
 
-            # --- START of HURM 4.0 Convergence-Focused Risk Calculation ---
+            # --- START of HURM 4.0 with "SUM TO 100" NORMALIZATION ---
             update_plan = []
             for pkg, cur, target in packages_to_update:
                 components = self._calculate_update_risk_components(pkg, cur, target)
@@ -211,16 +207,18 @@ class DependencyAgent:
 
             update_plan.sort(key=lambda p: (p['final_score'], p['code_impact_score']))
             
-            min_display_score = update_plan[0]['final_score'] if update_plan else 0
-            max_display_score = update_plan[-1]['final_score'] if update_plan else 0
+            # --- This is the new "Sum to 100" logic ---
+            total_score_sum = sum(p['final_score'] for p in update_plan) if update_plan else 0
             for p in update_plan:
-                 if max_display_score == min_display_score: p['norm_score_display'] = 0.0
-                 else: p['norm_score_display'] = ((p['final_score'] - min_display_score) / (max_display_score - min_display_score)) * 100.0
-            # --- END of HURM 4.0 Logic ---
+                 if total_score_sum == 0: p['risk_percent_display'] = 0.0
+                 else: p['risk_percent_display'] = (p['final_score'] / total_score_sum) * 100.0
+            # --- END OF NORMALIZATION LOGIC ---
 
             print("\nPrioritized Update Plan for this Pass (Lowest Risk First):")
+            print(f"{'Rank':<5} | {'Package':<30} | {'% of Total Risk':<18} | {'Change'}")
+            print(f"{'-'*5} | {'-'*30} | {'-'*18} | {'-'*20}")
             for i, p in enumerate(update_plan):
-                print(f"  {i+1}/{len(update_plan)}: {p['pkg']} (Risk: {p['norm_score_display']:.2f}) -> {p['target']}")
+                print(f"{i+1:<5} | {p['pkg']:<30} | {p['risk_percent_display']:<18.2f}% | {p['cur']} -> {p['target']}")
             
             for i, p_data in enumerate(update_plan):
                 package, current_ver, target_ver = p_data['pkg'], p_data['cur'], p_data['target']
@@ -306,6 +304,8 @@ class DependencyAgent:
             return max(stable_versions, key=parse_version) if stable_versions else max([p.version for p in package_info.packages if p.version], key=parse_version)
         except Exception: return None
 
+    # In agent_logic.py
+
     def _try_install_and_validate(self, package_to_update, new_version, dynamic_constraints, baseline_reqs_path, is_probe):
         venv_dir = Path("./temp_venv")
         if venv_dir.exists(): shutil.rmtree(venv_dir)
@@ -341,18 +341,29 @@ class DependencyAgent:
         _, stderr_install, returncode = run_command([python_executable, "-m", "pip", "install", "-r", str(temp_reqs_path)])
         
         if returncode != 0:
-            # THIS IS THE RESTORED DETAILED DIAGNOSTIC LOGIC
+            # --- START OF IMPROVED DIAGNOSTIC LOGIC ---
             print("INFO: Main installation failed. Analyzing conflict...")
-            conflict_match = re.search(r"Cannot install(?P<packages>[\s\S]+?)because", stderr_install)
-            reason = ""
+            
+            # This regex is now more robust and specifically looks for package names.
+            conflict_match = re.search(r"because these package versions have conflicting dependencies.\s*([\s\S]*)The conflict is caused by:", stderr_install, re.MULTILINE)
+            
+            reason = "Installation conflict" # Default reason
             if conflict_match:
-                conflicting_packages = ' '.join(conflict_match.group('packages').split()).replace(' and ', ', ').replace(',', ', ')
-                reason = f"Installation conflict: {conflicting_packages}"
-                print(f"DIAGNOSIS: {reason}")
+                try:
+                    # Extract the lines describing the conflict
+                    conflict_lines = conflict_match.group(1).strip().split('\n')
+                    packages_involved = [line.split(' ')[0].strip() for line in conflict_lines if line.strip()]
+                    reason = f"Installation conflict involving: {', '.join(packages_involved)}"
+                    print(f"DIAGNOSIS: {reason}")
+                except Exception:
+                    print("DIAGNOSIS: Could not parse specific conflicts. Falling back to LLM summary.")
+                    reason = self._ask_llm_to_summarize_error(stderr_install)
             else:
-                reason = "Installation conflict (Could not parse specific packages)"
-            return False, reason, stderr_install
-        
+                # Fallback if the primary regex fails
+                print("DIAGNOSIS: Could not parse conflict details directly. Falling back to LLM summary.")
+                reason = self._ask_llm_to_summarize_error(stderr_install)
+
+            return False, reason, stderr_install       
         group_title = f"Validation for {package_to_update}=={new_version}"
         success, metrics, validation_output = validate_changes(python_executable, self.config, group_title=group_title)
 
@@ -382,6 +393,8 @@ class DependencyAgent:
         
         return False, f"All healing attempts for {package} failed.", None
 
+    # In agent_logic.py
+
     def _heal_with_filter_and_scan(self, package, last_good_version, failed_version, baseline_reqs_path):
         start_group(f"Healing '{package}' with Filter-Then-Scan")
 
@@ -409,17 +422,26 @@ class DependencyAgent:
             temp_reqs_for_check = fixed_constraints + [f"{package}=={version}"]
             temp_reqs_path = venv_dir / "check_reqs.txt"
             with open(temp_reqs_path, "w") as f: f.write("\n".join(temp_reqs_for_check))
-            pip_command = [python_executable, "-m", "pip", "install", "--dry-run", "--quiet", "-r", str(temp_reqs_path)]
-            _, _, returncode = run_command(pip_command)
+            
+            # --- START OF IMPROVED LOGGING ---
+            # Now captures stderr to provide a reason for failure
+            pip_command = [python_executable, "-m", "pip", "install", "--dry-run", "-r", str(temp_reqs_path)]
+            _, stderr, returncode = run_command(pip_command)
+
             if returncode == 0:
                 print(f"     -- OK: {package}=={version} is installable.")
                 installable_versions.append(version)
+            else:
+                # Provide a concise summary of the conflict
+                summary = self._ask_llm_to_summarize_error(stderr)
+                print(f"     -- XX: {package}=={version} has a conflict. Reason: {summary}")
+            # --- END OF IMPROVED LOGGING ---
         
         if venv_dir.exists(): shutil.rmtree(venv_dir)
 
         print("\n--- Phase 2: Validating installable versions (newest first) ---")
         if not installable_versions:
-            print("No installable versions found in range."); end_group()
+            print("No installable versions found in range. The best version is the last good one."); end_group()
             return last_good_version
 
         for version_to_test in installable_versions:
@@ -432,7 +454,7 @@ class DependencyAgent:
                 end_group()
                 return version_to_test
         
-        print("\nINFO: No installable version passed validation."); end_group()
+        print("\nINFO: No installable version passed validation. The best version is the last good one."); end_group()
         return last_good_version
 
     def get_all_versions_between(self, package_name, start_ver_str, end_ver_str):
@@ -448,3 +470,30 @@ class DependencyAgent:
     def _prune_pip_freeze(self, freeze_output):
         lines = freeze_output.strip().split('\n')
         return "\n".join([line for line in lines if '==' in line and not line.startswith('-e')])
+
+    def _ask_llm_to_summarize_error(self, error_message):
+        """
+        Uses the LLM to generate a concise, one-sentence summary of a pip error log.
+        This is used for providing clear, human-readable diagnostics in logs.
+        """
+        # First, check if the LLM is available to prevent errors.
+        if not self.llm_available:
+            return "(LLM summary unavailable)"
+
+        # The prompt is engineered to be specific, asking for a single, concise sentence.
+        prompt = (
+            "The following is a Python pip install error log. Please summarize the "
+            "root cause of the conflict in a single, concise sentence. Focus on the names "
+            "of the packages that are in conflict and their version constraints. "
+            f"Error Log: --- {error_message} ---"
+        )
+        
+        try:
+            # Make the API call to the generative model.
+            response = self.llm.generate_content(prompt)
+            # Clean up the response to ensure it's a single, clean line for logging.
+            return response.text.strip().replace('\n', ' ')
+        except Exception as e:
+            # If the API call fails for any reason (e.g., quota, network), return a safe default.
+            print(f"  -> LLM_ERROR: Could not get summary: {e}")
+            return "Failed to get summary from LLM."
