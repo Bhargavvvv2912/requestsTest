@@ -305,7 +305,11 @@ class DependencyAgent:
         except Exception: return None
 
 
+    # In agent_logic.py
+
     def _try_install_and_validate(self, package_to_update, new_version, dynamic_constraints, baseline_reqs_path, is_probe):
+        start_group(f"Probe: Attempting install & validation for {package_to_update}=={new_version}")
+        
         venv_dir = Path("./temp_venv")
         if venv_dir.exists(): shutil.rmtree(venv_dir)
         venv.create(venv_dir, with_pip=True)
@@ -319,98 +323,76 @@ class DependencyAgent:
                     break
         
         if new_version == old_version:
-            if not is_probe:
-                print(f"--> Change analysis: '{package_to_update}' version remains at {old_version}. Validation skipped.")
+            print(f"--> Version is unchanged ({old_version}). Skipping probe.")
+            end_group()
             return True, "Validation skipped (no change)", ""
 
-        if not is_probe: print(f"\nChange analysis: Updating '{package_to_update}' from {old_version} -> {new_version}")
+        print(f"--> Preparing test environment: Updating '{package_to_update}' from {old_version} to {new_version}")
 
-        temp_reqs_path = venv_dir / "temp_requirements.txt"
-        with open(baseline_reqs_path, "r") as f_read, open(temp_reqs_path, "w") as f_write:
-            lines_for_file = []
-            for line in f_read:
+        # --- START OF CRITICAL CHANGE: Pass requirements directly to command line ---
+        requirements_list = []
+        with open(baseline_reqs_path, "r") as f:
+            for line in f:
                 line = line.strip()
                 if not line or line.startswith('#'): continue
                 if self._get_package_name_from_spec(line.split(';')[0]) == package_to_update:
                     marker_part = f" ;{line.split(';')[1]}" if ';' in line else ""
-                    lines_for_file.append(f"{package_to_update}=={new_version}{marker_part}")
-                else: lines_for_file.append(line)
-            f_write.write("\n".join(lines_for_file))
+                    requirements_list.append(f"{package_to_update}=={new_version}{marker_part}")
+                else:
+                    requirements_list.append(line)
+        
+        # This command is now much cleaner and will produce better error messages
+        pip_command = [python_executable, "-m", "pip", "install"] + requirements_list
+        # --- END OF CRITICAL CHANGE ---
 
-        # --- Stage 1: The Initial Install Attempt ---
-        _, stderr_install, returncode = run_command([python_executable, "-m", "pip", "install", "-r", str(temp_reqs_path)])
+        _, stderr_install, returncode = run_command(pip_command)
         
         if returncode != 0:
-            # --- START OF NEW, ROBUST DIAGNOSTIC PROCESS ---
-            print("INFO: Main installation failed. Re-running with verbose logging for detailed analysis...")
-
-            # --- Stage 2: The "Verbose Re-run" for Diagnostics ---
-            verbose_command = [python_executable, "-m", "pip", "install", "--verbose", "-r", str(temp_reqs_path)]
-            _, verbose_stderr, _ = run_command(verbose_command)
-
-            # --- Stage 3: Robust Parsing ---
-            # This regex looks for pip's detailed "User-provided" vs "Installed" dependency breakdown.
-            conflict_match = re.search(
-                r"\(from versions: .*\)\s*Found link[^,]+, version (?P<version_found>[^\s]+)", 
-                verbose_stderr, 
-                re.MULTILINE
-            )
-            
-            reason = "Installation conflict" # Default
+            print("--> ERROR: Installation failed. Analyzing conflict...")
+            # The error from pip is now directly readable, so we can use a simpler regex
+            conflict_match = re.search(r"because these package versions have conflicting dependencies.\s*([\s\S]*)The conflict is caused by:", stderr_install, re.MULTILINE)
+            reason = "Installation conflict"
             if conflict_match:
-                 # This is a much more robust way to find the actual conflicting package.
-                 # We look for what pip *would* install if it could.
-                 try:
-                    lines = verbose_stderr.split('\n')
-                    conflicting_package_line = ""
-                    for i, line in enumerate(lines):
-                        if "because these package versions have conflicting dependencies" in line:
-                            # The lines immediately following this error usually contain the root cause.
-                            conflicting_package_line = lines[i+2] if i + 2 < len(lines) else ""
-                            break
-                    
-                    if conflicting_package_line and "requires" in conflicting_package_line:
-                        # Example: "sqlalchemy 2.0.0 requires greenlet!=1.1.3"
-                        parts = conflicting_package_line.strip().split(" requires ")
-                        root_cause_package = parts[0]
-                        constraint = parts[1]
-                        reason = f"Installation conflict: {root_cause_package} requires {constraint}"
-                        print(f"DIAGNOSIS: {reason}")
-                    else:
-                        raise ValueError("Could not parse root cause line.")
+                try:
+                    conflict_lines = conflict_match.group(1).strip().split('\n')
+                    packages_involved = [line.split(' ')[0].strip() for line in conflict_lines if line.strip()]
+                    reason = f"Conflict involves: {', '.join(packages_involved)}"
+                except Exception:
+                    reason = "Conflict (Could not parse details)"
+            else: # Fallback for other error types
+                 summary = self._ask_llm_to_summarize_error(stderr_install)
+                 reason = f"Installation failed: {summary}"
 
-                 except Exception:
-                    print("DIAGNOSIS: Could not parse specific root cause. Falling back to LLM summary on verbose log.")
-                    reason = self._ask_llm_to_summarize_error(verbose_stderr)
-            else:
-                # --- Stage 4: LLM Summarization as a Fallback ---
-                print("DIAGNOSIS: Verbose log parsing failed. Falling back to LLM summary on original log.")
-                reason = self._ask_llm_to_summarize_error(stderr_install)
-
-            return False, reason, verbose_stderr # Return the richer verbose error log
-            # --- END OF NEW, ROBUST DIAGNOSTIC PROCESS ---
+            print(f"--> DIAGNOSIS: {reason}")
+            end_group()
+            return False, reason, stderr_install
         
-        group_title = f"Validation for {package_to_update}=={new_version}"
-        success, metrics, validation_output = validate_changes(python_executable, self.config, group_title=group_title)
+        print("--> Installation successful. Running validation suite...")
+        success, metrics, validation_output = validate_changes(python_executable, self.config, group_title=f"Running Validation on {package_to_update}=={new_version}")
 
         if not success:
+            print("--> ERROR: Validation script failed.")
+            end_group()
             return False, "Validation script failed", validation_output
+
+        print("--> SUCCESS: Installation and validation passed.")
+        end_group()
         return True, metrics, ""
-    
+
     def attempt_update_with_healing(self, package, current_version, target_version, dynamic_constraints, baseline_reqs_path):
-        print(f"\nAttempting to validate {package}=={target_version}...")
+        print(f"\n--> Toplevel Attempt: Trying direct update to {package}=={target_version}")
         
         success, result_data, stderr = self._try_install_and_validate(
             package, target_version, dynamic_constraints, baseline_reqs_path, is_probe=False
         )
         
         if success:
-            print(f"Direct update to {package}=={target_version} succeeded.")
+            print(f"--> Toplevel Result: Direct update to {package}=={target_version} SUCCEEDED.")
             return True, result_data if "skipped" in str(result_data) else target_version, None
 
-        print(f"\nINFO: Initial update for '{package}' failed. Reason: '{result_data}'")
-        start_group("View Full Error Log for Initial Failure"); print(stderr); end_group()
-        print("INFO: Entering healing mode with 'Filter-Then-Scan' strategy.")
+        print(f"\n--> Toplevel Result: Direct update FAILED. Reason: '{result_data}'")
+        # The full error log is now inside the probe's collapsible group, so we don't need another one.
+        print("--> Action: Entering healing mode with 'Filter-Then-Scan' strategy.")
 
         healed_version = self._heal_with_filter_and_scan(package, current_version, target_version, baseline_reqs_path)
         
@@ -419,15 +401,14 @@ class DependencyAgent:
         
         return False, f"All healing attempts for {package} failed.", None
 
-    # In agent_logic.py
-
     def _heal_with_filter_and_scan(self, package, last_good_version, failed_version, baseline_reqs_path):
-        start_group(f"Healing '{package}' with Filter-Then-Scan")
+        start_group(f"Healing '{package}': Filter-Then-Scan Strategy")
 
-        print("\n--- Phase 1: Filtering for installable versions ---")
+        # --- Phase 1: The High-Speed Compatibility Filter ---
+        print("\n--- Phase 1: Filtering for compatible versions ---")
         candidate_versions = self.get_all_versions_between(package, last_good_version, failed_version)
         if not candidate_versions:
-            print("No intermediate versions found to test."); end_group()
+            print("No intermediate versions to test."); end_group()
             return last_good_version
 
         fixed_constraints = []
@@ -444,34 +425,35 @@ class DependencyAgent:
         python_executable = str((venv_dir / "bin" / "python").resolve())
         
         for version in reversed(candidate_versions):
-            print(f"  -> Checking installability of {package}=={version}...")
-            temp_reqs_for_check = fixed_constraints + [f"{package}=={version}"]
-            temp_reqs_path = venv_dir / "check_reqs.txt"
-            with open(temp_reqs_path, "w") as f: f.write("\n".join(temp_reqs_for_check))
+            print(f"  -> Checking compatibility of {package}=={version}...")
+            requirements_list_for_check = fixed_constraints + [f"{package}=={version}"]
+            pip_command = [python_executable, "-m", "pip", "install", "--dry-run"] + requirements_list_for_check
             
-            # --- START OF IMPROVED LOGGING ---
-            # Now captures stderr to provide a reason for failure
-            pip_command = [python_executable, "-m", "pip", "install", "--dry-run", "-r", str(temp_reqs_path)]
-            _, stderr, returncode = run_command(pip_command)
+            # --- START OF CHANGE ---
+            # We now set display_command=False to suppress the noisy log line
+            _, stderr, returncode = run_command(pip_command, display_command=False)
+            # --- END OF CHANGE ---
 
             if returncode == 0:
-                print(f"     -- OK: {package}=={version} is installable.")
+                print(f"     -- [ OK ] Compatible.")
                 installable_versions.append(version)
             else:
-                # Provide a concise summary of the conflict
                 summary = self._ask_llm_to_summarize_error(stderr)
-                print(f"     -- XX: {package}=={version} has a conflict. Reason: {summary}")
-            # --- END OF IMPROVED LOGGING ---
+                print(f"     -- [ XX ] Incompatible. Reason: {summary}")
         
         if venv_dir.exists(): shutil.rmtree(venv_dir)
 
-        print("\n--- Phase 2: Validating installable versions (newest first) ---")
+        # --- Phase 2: The Linear Validation Scan ---
+        print("\n--- Phase 2: Validating compatible versions (newest first) ---")
         if not installable_versions:
-            print("No installable versions found in range. The best version is the last good one."); end_group()
+            print("Result: No compatible versions found in the given range. Reverting to last known good version.")
+            end_group()
             return last_good_version
+        
+        print(f"Found {len(installable_versions)} compatible versions to test:")
+        print(f"  -> {installable_versions}")
 
         for version_to_test in installable_versions:
-            print(f"  -> Validating {package}=={version_to_test}...")
             success, _, _ = self._try_install_and_validate(
                 package, version_to_test, [], baseline_reqs_path, is_probe=True
             )
@@ -480,9 +462,10 @@ class DependencyAgent:
                 end_group()
                 return version_to_test
         
-        print("\nINFO: No installable version passed validation. The best version is the last good one."); end_group()
+        print("\nResult: No compatible version passed validation. Reverting to last known good version.")
+        end_group()
         return last_good_version
-
+    
     def get_all_versions_between(self, package_name, start_ver_str, end_ver_str):
         try:
             package_info = self.pypi.get_project_page(package_name)
@@ -515,7 +498,6 @@ class DependencyAgent:
         )
         
         try:
-            # Make the API call to the generative model.
             response = self.llm.generate_content(prompt)
             # Clean up the response to ensure it's a single, clean line for logging.
             return response.text.strip().replace('\n', ' ')

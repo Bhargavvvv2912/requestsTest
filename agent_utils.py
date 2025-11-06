@@ -13,10 +13,13 @@ def end_group():
     """Ends a collapsible log group in GitHub Actions."""
     print("::endgroup::")
 
-def run_command(command, cwd=None):
+def run_command(command, cwd=None, display_command=True):
     """Runs a command and returns the output, error, and return code."""
-    display_command = ' '.join(command)
-    print(f"--> Running command: '{display_command}' in CWD: '{cwd or '.'}'")
+    # --- START OF CHANGE ---
+    if display_command:
+        display_str = ' '.join(command)
+        print(f"--> Running command: '{display_str}' in CWD: '{cwd or '.'}'")
+    # --- END OF CHANGE ---
     result = subprocess.run(command, capture_output=True, text=True, cwd=cwd)
     return result.stdout, result.stderr, result.returncode
 
