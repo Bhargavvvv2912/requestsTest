@@ -21,34 +21,34 @@ class DependencyAgent:
         self.requirements_path = Path(config["REQUIREMENTS_FILE"])
         self.primary_packages = self._load_primary_packages()
         self.llm_available = True
-        self.usage_scores = self._calculate_risk_scores()
+        self.usage_scores = self._calculate_update_risk_components()
         self.exclusions_from_this_run = set()
 
-    def _calculate_risk_scores(self):
-        start_group("Analyzing Codebase for Update Risk")
-        scores = {}
-        repo_root = Path('.')
-        for py_file in repo_root.rglob('*.py'):
-            if any(part in str(py_file) for part in ['temp_venv', 'final_venv', 'bootstrap_venv', 'agent_logic.py', 'agent_utils.py', 'dependency_agent.py']):
-                continue
-            try:
-                with open(py_file, 'r', encoding='utf-8') as f:
-                    content = f.read()
-                    tree = ast.parse(content)
-                    for node in ast.walk(tree):
-                        if isinstance(node, ast.Import):
-                            for alias in node.names:
-                                module_name = self._get_package_name_from_spec(alias.name)
-                                scores[module_name] = scores.get(module_name, 0) + 1
-                        elif isinstance(node, ast.ImportFrom) and node.module:
-                            module_name = self._get_package_name_from_spec(node.module)
-                            scores[module_name] = scores.get(module_name, 0) + 1
-            except Exception: continue
+
+    def _calculate_update_risk_components(self, package, current_ver_str, target_ver_str):
+        """Calculates the raw, unweighted components of the HURM 4.0 risk score."""
+        try:
+            old_v, new_v = parse_version(current_ver_str), parse_version(target_ver_str)
+            if new_v.major > old_v.major: severity_score = 10
+            elif new_v.minor > old_v.minor: severity_score = 5
+            else: severity_score = 1
+        except Exception:
+            severity_score = 5
+
+        usage_score = self.usage_scores.get(package, 0)
+        criticality_score = 1 if package in self.primary_packages else 0
         
-        normalized_scores = {name.replace('_', '-'): score for name, score in scores.items()}
-        print("Usage scores calculated.")
-        end_group()
-        return normalized_scores
+        # This part requires you to have a pre-computed dependency graph
+        if hasattr(self, 'dependency_graph_metrics') and package in self.dependency_graph_metrics:
+            ecosystem_score = self.dependency_graph_metrics[package].get('dependents', 0)
+            depth_score = self.dependency_graph_metrics[package].get('depth', 0)
+        else:
+            ecosystem_score, depth_score = 0, 0
+            
+        return {
+            "severity": severity_score, "usage": usage_score, "criticality": criticality_score,
+            "ecosystem": ecosystem_score, "depth": depth_score
+        }
 
     def _get_package_name_from_spec(self, spec_line):
         match = re.match(r'([a-zA-Z0-9\-_]+)', spec_line)
@@ -110,6 +110,8 @@ class DependencyAgent:
         installed_packages, _, _ = run_command([python_executable, "-m", "pip", "freeze"])
         return True, {"metrics": metrics, "packages": self._prune_pip_freeze(installed_packages)}, None
 
+    # In agent_logic.py
+
     def run(self):
         if os.path.exists(self.config["METRICS_OUTPUT_FILE"]):
             os.remove(self.config["METRICS_OUTPUT_FILE"])
@@ -124,6 +126,14 @@ class DependencyAgent:
         final_successful_updates, final_failed_updates = {}, {}
         pass_num = 0
         
+        # --- Placeholder for dependency graph parsing ---
+        # For HURM 4.0, you would run `pipdeptree --json-tree` here on the initial
+        # environment and parse the output into self.dependency_graph_metrics.
+        if not hasattr(self, 'dependency_graph_metrics'):
+            print("INFO: Dependency graph metrics not found. Entanglement scores will be 0.")
+            self.dependency_graph_metrics = {}
+        # --- End of placeholder ---
+
         while pass_num < self.config["MAX_RUN_PASSES"]:
             pass_num += 1
             start_group(f"UPDATE PASS {pass_num}/{self.config['MAX_RUN_PASSES']}")
@@ -154,14 +164,40 @@ class DependencyAgent:
                 if progressive_baseline_path.exists(): progressive_baseline_path.unlink()
                 break 
 
-            packages_to_update.sort(key=lambda p: self._calculate_update_risk(p[0], p[1], p[2]), reverse=False)
-            print("\nPrioritized Update Plan for this Pass (Lowest Risk First):")
-            for i, (pkg, cur_ver, target_ver) in enumerate(packages_to_update):
-                score = self._calculate_update_risk(pkg, cur_ver, target_ver)
-                print(f"  {i+1}/{len(packages_to_update)}: {pkg} (Risk: {score:.2f}) -> {target_ver}")
+            # --- START of HURM 4.0 Convergence-Focused Risk Calculation ---
+            update_plan = []
+            for pkg, cur, target in packages_to_update:
+                components = self._calculate_update_risk_components(pkg, cur, target)
+                update_plan.append({'pkg': pkg, 'cur': cur, 'target': target, 'components': components})
+
+            max_ecosystem = max(p['components']['ecosystem'] for p in update_plan) if update_plan else 0
+            max_depth = max(p['components']['depth'] for p in update_plan) if update_plan else 0
+
+            W_ECOSYSTEM, W_DEPTH = 1.0, 0.5
+            for p in update_plan:
+                comps = p['components']
+                norm_ecosystem = (comps['ecosystem'] / max_ecosystem) if max_ecosystem > 0 else 0
+                norm_depth = (comps['depth'] / max_depth) if max_depth > 0 else 0
+                entanglement_score = (W_ECOSYSTEM * norm_ecosystem) + (W_DEPTH * norm_depth)
+                p['final_score'] = (comps['severity'] * 10) + entanglement_score
+                p['code_impact_score'] = comps['usage'] + (comps['criticality'] * 10)
+
+            update_plan.sort(key=lambda p: (p['final_score'], p['code_impact_score']))
             
-            for i, (package, current_ver, target_ver) in enumerate(packages_to_update):
-                print(f"\n" + "-"*80); print(f"PULSE: [PASS {pass_num} | ATTEMPT {i+1}/{len(packages_to_update)}] Processing '{package}'"); print(f"PULSE: Changed packages this pass so far: {changed_packages_this_pass}"); print("-"*80)
+            min_display_score = update_plan[0]['final_score'] if update_plan else 0
+            max_display_score = update_plan[-1]['final_score'] if update_plan else 0
+            for p in update_plan:
+                 if max_display_score == min_display_score: p['norm_score_display'] = 0.0
+                 else: p['norm_score_display'] = ((p['final_score'] - min_display_score) / (max_display_score - min_display_score)) * 100.0
+            # --- END of HURM 4.0 Logic ---
+
+            print("\nPrioritized Update Plan for this Pass (Lowest Risk First):")
+            for i, p in enumerate(update_plan):
+                print(f"  {i+1}/{len(update_plan)}: {p['pkg']} (Risk: {p['norm_score_display']:.2f}) -> {p['target']}")
+            
+            for i, p_data in enumerate(update_plan):
+                package, current_ver, target_ver = p_data['pkg'], p_data['cur'], p_data['target']
+                print(f"\n" + "-"*80); print(f"PULSE: [PASS {pass_num} | ATTEMPT {i+1}/{len(update_plan)}] Processing '{package}'"); print(f"PULSE: Changed packages this pass so far: {changed_packages_this_pass}"); print("-"*80)
                 
                 success, reason_or_new_version, _ = self.attempt_update_with_healing(
                     package, current_ver, target_ver, [], progressive_baseline_path
@@ -203,18 +239,6 @@ class DependencyAgent:
         if final_successful_updates:
             self._print_final_summary(final_successful_updates, final_failed_updates)
             self._run_final_health_check()
-
-    def _calculate_update_risk(self, package, current_ver_str, target_ver_str):
-        W_SEVERITY, W_INTEGRATION, W_CRITICALITY = 500, 1, 250
-        try:
-            old_v, new_v = parse_version(current_ver_str), parse_version(target_ver_str)
-            if new_v.major > old_v.major: severity_score = 10
-            elif new_v.minor > old_v.minor: severity_score = 5
-            else: severity_score = 1
-        except Exception: severity_score = 5
-        integration_score = self.usage_scores.get(package, 0)
-        criticality_score = 1 if package in self.primary_packages else 0
-        return (W_SEVERITY * severity_score) + (W_INTEGRATION * integration_score) + (W_CRITICALITY * criticality_score)
 
     def _print_final_summary(self, successful, failed):
         print("\n" + "#"*70); print("### OVERALL UPDATE RUN SUMMARY ###")

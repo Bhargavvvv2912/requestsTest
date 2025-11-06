@@ -12,7 +12,7 @@ coverage==7.11.0
 cryptography==46.0.3
 decorator==5.2.1
 flasgger==0.9.7.1
-Flask==3.1.2
+Flask==3.0.3
 google-ai-generativelanguage==0.6.15
 google-api-core==2.28.1
 google-api-python-client==2.186.0
@@ -37,7 +37,7 @@ mistune==3.1.4
 packaging==25.0
 pluggy==1.6.0
 proto-plus==1.26.1
-protobuf==5.29.5
+protobuf==4.25.3
 pyasn1==0.6.1
 pyasn1_modules==0.4.2
 pycparser==2.23
@@ -61,5 +61,5 @@ trustme==1.2.1
 typing-inspection==0.4.2
 typing_extensions==4.15.0
 uritemplate==4.2.0
-urllib3==2.5.0
+urllib3==1.26.18
 Werkzeug==3.1.3
