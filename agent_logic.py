@@ -21,9 +21,36 @@ class DependencyAgent:
         self.requirements_path = Path(config["REQUIREMENTS_FILE"])
         self.primary_packages = self._load_primary_packages()
         self.llm_available = True
-        self.usage_scores = self._calculate_update_risk_components()
+        self.usage_scores = self._calculate_risk_scores()
         self.exclusions_from_this_run = set()
+    
+    # In agent_logic.py
 
+    def _calculate_risk_scores(self):
+        start_group("Analyzing Codebase for Update Risk")
+        scores = {}
+        repo_root = Path('.')
+        for py_file in repo_root.rglob('*.py'):
+            if any(part in str(py_file) for part in ['temp_venv', 'final_venv', 'bootstrap_venv', 'agent_logic.py', 'agent_utils.py', 'dependency_agent.py']):
+                continue
+            try:
+                with open(py_file, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                    tree = ast.parse(content)
+                    for node in ast.walk(tree):
+                        if isinstance(node, ast.Import):
+                            for alias in node.names:
+                                module_name = self._get_package_name_from_spec(alias.name)
+                                scores[module_name] = scores.get(module_name, 0) + 1
+                        elif isinstance(node, ast.ImportFrom) and node.module:
+                            module_name = self._get_package_name_from_spec(node.module)
+                            scores[module_name] = scores.get(module_name, 0) + 1
+            except Exception: continue
+        
+        normalized_scores = {name.replace('_', '-'): score for name, score in scores.items()}
+        print("Usage scores calculated.")
+        end_group()
+        return normalized_scores
 
     def _calculate_update_risk_components(self, package, current_ver_str, target_ver_str):
         """Calculates the raw, unweighted components of the HURM 4.0 risk score."""
