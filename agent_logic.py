@@ -8,6 +8,7 @@ import ast
 import shutil
 import re
 import json
+import subprocess
 from google.api_core.exceptions import ResourceExhausted
 from pypi_simple import PyPISimple
 from packaging.version import parse as parse_version
@@ -144,49 +145,28 @@ class DependencyAgent:
         if os.path.exists(self.config["METRICS_OUTPUT_FILE"]):
             os.remove(self.config["METRICS_OUTPUT_FILE"])
         
-        # --- START OF DEFINITIVE ARCHITECTURE ---
+        # --- START OF "REPAIR THE BASELINE" ARCHITECTURE ---
+        print("INFO: Performing Initial Baseline Health Check...")
+        start_group("Initial Baseline Health Check")
         
-        # STEP 1: Establish and Validate the Initial Baseline
-        is_pinned, _ = self._get_requirements_state()
-        if not is_pinned:
-            # If requirements are unpinned, bootstrap is the initial health check.
-            self._bootstrap_unpinned_requirements()
+        venv_dir = Path("./initial_check_venv")
+        if venv_dir.exists(): shutil.rmtree(venv_dir)
+        venv.create(venv_dir, with_pip=True)
+        
+        success, _, error_log = self._run_bootstrap_and_validate(venv_dir, self.requirements_path)
+        end_group()
+        
+        if not success:
+            print("WARNING: Initial baseline is broken. Activating 'Repair Mode'.", file=sys.stderr)
+            repair_succeeded = self._run_repair_mode(error_log)
+            if not repair_succeeded:
+                sys.exit("CRITICAL ERROR: The initial baseline is broken and could not be automatically repaired.")
+            else:
+                print("\nINFO: Baseline successfully repaired. Proceeding to normal update pass.")
         else:
-            # If requirements are already pinned, run an initial health check.
-            print("INFO: Found pinned requirements. Running initial health check on the baseline...")
-            start_group("Initial Baseline Health Check")
-            
-            venv_dir = Path("./initial_check_venv")
-            if venv_dir.exists(): shutil.rmtree(venv_dir)
-            venv.create(venv_dir, with_pip=True)
-            python_executable = str((venv_dir / "bin" / "python").resolve())
-            
-            # For pure Python projects, CWD for install is less critical but good practice.
-            project_dir = self.config.get("VALIDATION_CONFIG", {}).get("project_dir")
-            req_path = str(self.requirements_path.resolve())
-            pip_command = [python_executable, "-m", "pip", "install", "-r", req_path]
-            
-            _, stderr, returncode = run_command(pip_command, cwd=project_dir)
-            if returncode != 0:
-                print("CRITICAL ERROR: Initial installation of baseline dependencies failed!", file=sys.stderr)
-                print(f"STDERR:\n{stderr}")
-                end_group()
-                sys.exit("Bootstrap failed: Could not install from the provided requirements file.")
-
-            success, _, output = validate_changes(python_executable, self.config)
-            if not success:
-                print("CRITICAL ERROR: The initial baseline failed the validation suite.", file=sys.stderr)
-                print(f"Validation Output:\n{output}")
-                end_group()
-                sys.exit("Bootstrap failed: The provided requirements are not 'provably working'.")
-            
             print("Initial baseline is valid and stable.")
-            end_group()
-        
-        # --- END OF DEFINITIVE ARCHITECTURE ---
+        # --- END OF "REPAIR THE BASELINE" ARCHITECTURE ---
 
-        # At this point, we have a guaranteed "provably working" baseline.
-        
         final_successful_updates, final_failed_updates = {}, {}
         pass_num = 0
         
@@ -216,7 +196,6 @@ class DependencyAgent:
                 if progressive_baseline_path.exists(): progressive_baseline_path.unlink()
                 break 
 
-            # HURM 4.0 Risk Calculation
             update_plan = []
             for pkg, cur, target in packages_to_update:
                 components = self._calculate_update_risk_components(pkg, cur, target)
@@ -231,7 +210,6 @@ class DependencyAgent:
                 p['final_score'] = (comps['severity'] * 10) + entanglement_score
                 p['code_impact_score'] = comps['usage'] + (comps['criticality'] * 10)
             
-            # --- "HIGH-RISK FIRST" STRATEGY ---
             update_plan.sort(key=lambda p: (p['final_score'], p['code_impact_score']), reverse=True)
             
             total_score_sum = sum(p['final_score'] for p in update_plan) if update_plan else 0
@@ -283,6 +261,74 @@ class DependencyAgent:
         if final_successful_updates:
             self._print_final_summary(final_successful_updates, final_failed_updates)
             print("\nRun complete. The final requirements.txt is the latest provably working version.")
+    
+
+    def _run_repair_mode(self, error_log):
+        """
+        Attempts a targeted, "surgical" repair of a broken baseline requirements file.
+        """
+        start_group("REPAIR MODE: Attempting to fix broken baseline")
+        
+        # --- Step 1: Diagnose the conflicting packages ---
+        print("--> Step 1: Diagnosing conflicting packages from error log...")
+        conflicting_packages = self._get_conflicting_packages_from_log(error_log)
+        if not conflicting_packages:
+            print("--> DIAGNOSIS FAILED: Could not determine specific conflicting packages. Aborting repair.", file=sys.stderr)
+            end_group()
+            return False
+
+        print(f"--> Diagnosis: Conflict appears to involve {conflicting_packages}")
+
+        # --- Step 2: Create a surgical requirements.in file ---
+        print("\n--> Step 2: Preparing a surgical repair plan by unpinning conflicting packages...")
+        requirements_in_path = Path("repair.in")
+        with open(self.requirements_path, 'r') as f_read, open(requirements_in_path, 'w') as f_write:
+            for line in f_read:
+                pkg_name = self._get_package_name_from_spec(line)
+                if pkg_name and pkg_name.lower() in (p.lower() for p in conflicting_packages):
+                    print(f"     - Unpinning '{pkg_name}' for re-resolution.")
+                    f_write.write(f"{pkg_name}\n")
+                else:
+                    f_write.write(line)
+        
+        # --- Step 3: Run pip-compile to find a new theoretical solution ---
+        print("\n--> Step 3: Re-compiling requirements to find a new solution...")
+        repaired_reqs_path = Path("repaired-requirements.txt")
+        compile_cmd = ["pip-compile", "--resolver=backtracking", "--output-file", str(repaired_reqs_path), str(requirements_in_path)]
+        result = subprocess.run(compile_cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            print("--> REPAIR FAILED: pip-compile could not find a theoretical solution.", file=sys.stderr)
+            print(result.stderr, file=sys.stderr)
+            end_group()
+            return False
+            
+        print("--> Found a new, theoretically compatible set of versions.")
+
+        # --- Step 4: Validate the proposed repair ---
+        print("\n--> Step 4: Validating the repaired requirements file...")
+        venv_dir = Path("./repair_check_venv")
+        success, _, _ = self._run_bootstrap_and_validate(venv_dir, repaired_reqs_path)
+        
+        if success:
+            print("--> REPAIR SUCCESSFUL! The baseline is now provably working.")
+            shutil.copy(repaired_reqs_path, self.requirements_path)
+            end_group()
+            return True
+        else:
+            print("--> REPAIR FAILED: The repaired requirements file failed the validation suite.", file=sys.stderr)
+            end_group()
+            return False
+
+    def _get_conflicting_packages_from_log(self, error_log):
+        """A helper to extract package names from a pip 'ResolutionImpossible' error."""
+        # This regex is designed to find package names in "Cannot install A, B, and C" messages.
+        match = re.search(r"Cannot install ([\s\S]+?) because", error_log)
+        if not match: return []
+        
+        # Split by comma and 'and', then clean up and extract the name
+        raw_packages = match.group(1).replace(' and ', ',').split(',')
+        packages = [self._get_package_name_from_spec(p.strip()) for p in raw_packages]
+        return [p for p in packages if p] # Filter out any None values
 
     def _print_final_summary(self, successful, failed):
         print("\n" + "#"*70); print("### OVERALL UPDATE RUN SUMMARY ###")
