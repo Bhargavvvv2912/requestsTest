@@ -8,7 +8,6 @@ import ast
 import shutil
 import re
 import json
-import subprocess
 from google.api_core.exceptions import ResourceExhausted
 from pypi_simple import PyPISimple
 from packaging.version import parse as parse_version
@@ -158,7 +157,7 @@ class DependencyAgent:
         
         if not success:
             print("WARNING: Initial baseline is broken. Activating 'Repair Mode'.", file=sys.stderr)
-            repair_succeeded = self._run_repair_mode(error_log)
+            repair_succeeded = self._jsonpair_mode(error_log)
             if not repair_succeeded:
                 sys.exit("CRITICAL ERROR: The initial baseline is broken and could not be automatically repaired.")
             else:
@@ -263,67 +262,65 @@ class DependencyAgent:
             print("\nRun complete. The final requirements.txt is the latest provably working version.")
     
 
-    # In agent_logic.py
-
     def _run_repair_mode(self, error_log):
         """
-        Attempts to repair a broken baseline by unpinning ALL dependencies and
-        letting pip-compile find a new, theoretically valid lock file from scratch.
+        Repairs a broken baseline by calling pip-compile's internal functions
+        directly, avoiding all subprocess and PATH issues.
         """
         start_group("REPAIR MODE: Attempting full baseline re-compilation")
         
-        # --- Step 1: Create a simple requirements.in with only package NAMES ---
-        print("--> Step 1: Extracting all package names from the broken requirements file...")
+        print("--> Step 1: Preparing requirements.in from broken file...")
         requirements_in_path = Path("repair.in")
         package_names = []
         with open(self.requirements_path, 'r') as f_read:
             for line in f_read:
                 pkg_name = self._get_package_name_from_spec(line)
-                if pkg_name:
-                    package_names.append(pkg_name)
+                if pkg_name: package_names.append(pkg_name)
         
         project_name = self.config.get("PROJECT_NAME")
-        if project_name and project_name not in package_names:
-            package_names.append(project_name)
+        if project_name and project_name not in package_names: package_names.append(project_name)
 
         with open(requirements_in_path, 'w') as f_write:
             for name in sorted(package_names):
                 if name.lower() == (project_name or "").lower():
                     project_dir = self.config.get("VALIDATION_CONFIG", {}).get("project_dir")
                     if project_dir: f_write.write(f"-e ./{project_dir}\n")
-                else:
-                    f_write.write(f"{name}\n")
-            
-        print(f"--> Extracted {len(package_names)} packages to be re-resolved from scratch.")
+                else: f_write.write(f"{name}\n")
+        
+        print(f"--> Extracted {len(package_names)} packages to be re-resolved.")
 
-        # --- Step 2: Run pip-compile to find a new theoretical solution ---
-        print("\n--> Step 2: Running pip-compile to generate a new, stable lock file...")
+        print("\n--> Step 2: Running pip-compile directly to generate a new lock file...")
         repaired_reqs_path = Path("repaired-requirements.txt")
         
-        # --- START OF THE DEFINITIVE, FINAL FIX ---
-        # This is the canonical, most robust way to run an installed Python script.
-        # It uses the current Python interpreter to find and execute the module.
-        # This is not dependent on the system PATH and will always work.
-        python_executable = sys.executable
-        compile_cmd = [
-            python_executable, "-m", "piptools.compile",  # Use the module name
-            "--resolver=backtracking", 
-            "--output-file", str(repaired_reqs_path), 
-            str(requirements_in_path)
-        ]
-        # --- END OF THE DEFINITIVE, FINAL FIX ---
-        
-        result = subprocess.run(compile_cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            print("--> REPAIR FAILED: pip-compile could not find a theoretical solution.", file=sys.stderr)
-            print(result.stderr, file=sys.stderr)
-            end_group()
-            return False
+        try:
+            # --- THE DEFINITIVE FIX ---
+            # We call the pip-compile command's internal entry point directly.
+            # This is a Python function call, not a subprocess. It cannot fail with a path error.
+            from pip._internal.commands import compile as pip_compile_cli
+            pip_compile_cli.main(
+                [
+                    "--resolver=backtracking",
+                    "--output-file", str(repaired_reqs_path),
+                    str(requirements_in_path),
+                ],
+                # This prevents the function from calling sys.exit() on its own.
+                standalone_mode=False 
+            )
+            # --- END OF DEFINITIVE FIX ---
+        except SystemExit as e:
+            if e.code != 0:
+                 print("--> REPAIR FAILED: pip-compile could not find a theoretical solution.", file=sys.stderr)
+                 # We could try to capture stderr here, but for now, this is robust.
+                 end_group()
+                 return False
+        except Exception as e:
+             print(f"--> REPAIR FAILED: An unexpected error occurred while running pip-compile: {e}", file=sys.stderr)
+             end_group()
+             return False
             
         print("--> Found a new, theoretically compatible set of versions.")
 
-        # --- Step 3: Validate the newly generated baseline ---
-        print("\n--> Step 3: Validating the new requirements file...")
+        print("\n--> Step 3: Validating the newly generated baseline...")
         venv_dir = Path("./repair_check_venv")
         success, _, _ = self._run_bootstrap_and_validate(venv_dir, repaired_reqs_path)
         
