@@ -33,13 +33,16 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pip-
 
-      - name: Force Install Latest Agent Dependencies
+      - name: Install Agent Dependencies and Tools
         run: |
-          # 1. THE NUKE: This is the critical step.
-          python -m pip uninstall -y google-generativeai
-          
-          # 2. THE PAVE: Now, pip has no choice.
-          python -m pip install google-generativeai pypi-simple packaging
+          # We now install all tools the agent might need, including pip-tools for the repair mode.
+          # We also pin pip-tools to a known stable version.
+          python -m pip install \
+            google-generativeai \
+            pypi-simple \
+            packaging \
+            "pip-tools==6.13.0" \
+            "toml"
 
       - name: Run the Autonomous Agent
         run: python dependency_agent.py

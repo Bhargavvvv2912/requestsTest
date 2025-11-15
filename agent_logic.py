@@ -8,6 +8,7 @@ import ast
 import shutil
 import re
 import json
+import subprocess
 from google.api_core.exceptions import ResourceExhausted
 from pypi_simple import PyPISimple
 from packaging.version import parse as parse_version
@@ -157,7 +158,7 @@ class DependencyAgent:
         
         if not success:
             print("WARNING: Initial baseline is broken. Activating 'Repair Mode'.", file=sys.stderr)
-            repair_succeeded = self._jsonpair_mode(error_log)
+            repair_succeeded = self._run_repair_mode(error_log)
             if not repair_succeeded:
                 sys.exit("CRITICAL ERROR: The initial baseline is broken and could not be automatically repaired.")
             else:
