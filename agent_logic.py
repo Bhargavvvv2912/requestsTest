@@ -265,8 +265,6 @@ class DependencyAgent:
 
     # In agent_logic.py
 
-    # In agent_logic.py
-
     def _run_repair_mode(self, error_log):
         """
         Attempts to repair a broken baseline by unpinning ALL dependencies and
@@ -284,7 +282,6 @@ class DependencyAgent:
                 if pkg_name:
                     package_names.append(pkg_name)
         
-        # For compilable projects, we ensure the project itself is in the list for editable install
         project_name = self.config.get("PROJECT_NAME")
         if project_name and project_name not in package_names:
             package_names.append(project_name)
@@ -303,18 +300,18 @@ class DependencyAgent:
         print("\n--> Step 2: Running pip-compile to generate a new, stable lock file...")
         repaired_reqs_path = Path("repaired-requirements.txt")
         
-        # --- START OF DEFINITIVE FIX ---
-        # Construct the absolute path to the pip-compile executable to avoid all PATH issues.
+        # --- START OF THE DEFINITIVE, FINAL FIX ---
+        # This is the canonical, most robust way to run an installed Python script.
+        # It uses the current Python interpreter to find and execute the module.
+        # This is not dependent on the system PATH and will always work.
         python_executable = sys.executable
-        pip_compile_executable = str(Path(python_executable).parent / "pip-compile")
-        
         compile_cmd = [
-            pip_compile_executable, 
+            python_executable, "-m", "piptools.compile",  # Use the module name
             "--resolver=backtracking", 
             "--output-file", str(repaired_reqs_path), 
             str(requirements_in_path)
         ]
-        # --- END OF DEFINITIVE FIX ---
+        # --- END OF THE DEFINITIVE, FINAL FIX ---
         
         result = subprocess.run(compile_cmd, capture_output=True, text=True)
         if result.returncode != 0:
