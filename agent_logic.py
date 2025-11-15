@@ -263,21 +263,25 @@ class DependencyAgent:
             print("\nRun complete. The final requirements.txt is the latest provably working version.")
     
 
+    # In agent_logic.py
+
     def _run_repair_mode(self, error_log):
         """
-        Attempts a targeted, "surgical" repair of a broken baseline requirements file.
+        Attempts a targeted, "surgical" repair of a broken baseline by delegating
+        diagnosis to the Expert Agent.
         """
         start_group("REPAIR MODE: Attempting to fix broken baseline")
         
-        # --- Step 1: Diagnose the conflicting packages ---
-        print("--> Step 1: Diagnosing conflicting packages from error log...")
-        conflicting_packages = self._get_conflicting_packages_from_log(error_log)
+        # --- Step 1: Delegate Diagnosis to the Expert Agent ---
+        print("--> Step 1: Delegating diagnosis to the Expert Agent (CORE)...")
+        conflicting_packages = self.expert.diagnose_conflict_from_log(error_log)
+        
         if not conflicting_packages:
-            print("--> DIAGNOSIS FAILED: Could not determine specific conflicting packages. Aborting repair.", file=sys.stderr)
+            print("--> DIAGNOSIS FAILED: Expert Agent could not determine conflicting packages. Aborting repair.", file=sys.stderr)
             end_group()
             return False
 
-        print(f"--> Diagnosis: Conflict appears to involve {conflicting_packages}")
+        print(f"--> Expert Diagnosis: Conflict involves {conflicting_packages}")
 
         # --- Step 2: Create a surgical requirements.in file ---
         print("\n--> Step 2: Preparing a surgical repair plan by unpinning conflicting packages...")
@@ -294,7 +298,13 @@ class DependencyAgent:
         # --- Step 3: Run pip-compile to find a new theoretical solution ---
         print("\n--> Step 3: Re-compiling requirements to find a new solution...")
         repaired_reqs_path = Path("repaired-requirements.txt")
-        compile_cmd = ["pip-compile", "--resolver=backtracking", "--output-file", str(repaired_reqs_path), str(requirements_in_path)]
+        
+        python_executable = sys.executable
+        compile_cmd = [
+            python_executable, "-m", "piptools.scripts.compile", 
+            "--resolver=backtracking", "--output-file", str(repaired_reqs_path), 
+            str(requirements_in_path)
+        ]
         result = subprocess.run(compile_cmd, capture_output=True, text=True)
         if result.returncode != 0:
             print("--> REPAIR FAILED: pip-compile could not find a theoretical solution.", file=sys.stderr)

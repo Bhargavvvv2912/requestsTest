@@ -114,3 +114,46 @@ class ExpertAgent:
         except (json.JSONDecodeError, AttributeError, Exception) as e:
             print(f"  -> LLM_ERROR: Could not get/parse co-resolution plan: {e}")
             return None
+        
+        # In expert_agent.py
+
+    def diagnose_conflict_from_log(self, error_log: str) -> list[str]:
+        """
+        Analyzes a pip error log and returns a structured list of conflicting package names.
+        """
+        if not self.llm_available:
+            return []
+
+        prompt = f"""
+        You are an expert Python dependency conflict analyst. Your task is to read a pip
+        error log and identify the specific, root-cause package names that are in conflict.
+
+        Respond ONLY with a valid, clean JSON list of strings.
+
+        EXAMPLE 1:
+        Log: "ERROR: Cannot install -r file.txt (line 16) and google-api-core==1.34.0 because..."
+        Response: ["google-api-core", "google-generativeai"]
+
+        EXAMPLE 2:
+        Log: "ERROR: a==1.0 requires b<2.0, but you have b==2.5"
+        Response: ["a", "b"]
+
+        Here is the error log to analyze:
+        --- ERROR LOG ---
+        {error_log}
+        --- END ERROR LOG ---
+        """
+        try:
+            response = self.llm.generate_content(prompt)
+            match = re.search(r'\[.*\]', response.text, re.DOTALL)
+            if not match:
+                print(f"  -> LLM_WARNING: Diagnose conflict response was not valid JSON list: {response.text}")
+                return []
+            
+            package_list = json.loads(match.group(0))
+            if isinstance(package_list, list) and all(isinstance(p, str) for p in package_list):
+                return package_list
+            return []
+        except (json.JSONDecodeError, AttributeError, Exception) as e:
+            print(f"  -> LLM_ERROR: Could not get/parse conflict diagnosis: {e}")
+            return []
