@@ -265,6 +265,8 @@ class DependencyAgent:
 
     # In agent_logic.py
 
+    # In agent_logic.py
+
     def _run_repair_mode(self, error_log):
         """
         Attempts to repair a broken baseline by unpinning ALL dependencies and
@@ -278,7 +280,6 @@ class DependencyAgent:
         package_names = []
         with open(self.requirements_path, 'r') as f_read:
             for line in f_read:
-                # This handles both regular and editable installs correctly
                 pkg_name = self._get_package_name_from_spec(line)
                 if pkg_name:
                     package_names.append(pkg_name)
@@ -290,10 +291,9 @@ class DependencyAgent:
 
         with open(requirements_in_path, 'w') as f_write:
             for name in sorted(package_names):
-                if name == project_name:
-                    # The project itself must be an editable install
+                if name.lower() == (project_name or "").lower():
                     project_dir = self.config.get("VALIDATION_CONFIG", {}).get("project_dir")
-                    f_write.write(f"-e ./{project_dir}\n")
+                    if project_dir: f_write.write(f"-e ./{project_dir}\n")
                 else:
                     f_write.write(f"{name}\n")
             
@@ -303,12 +303,19 @@ class DependencyAgent:
         print("\n--> Step 2: Running pip-compile to generate a new, stable lock file...")
         repaired_reqs_path = Path("repaired-requirements.txt")
         
+        # --- START OF DEFINITIVE FIX ---
+        # Construct the absolute path to the pip-compile executable to avoid all PATH issues.
         python_executable = sys.executable
+        pip_compile_executable = str(Path(python_executable).parent / "pip-compile")
+        
         compile_cmd = [
-            python_executable, "-m", "piptools.scripts.compile", 
-            "--resolver=backtracking", "--output-file", str(repaired_reqs_path), 
+            pip_compile_executable, 
+            "--resolver=backtracking", 
+            "--output-file", str(repaired_reqs_path), 
             str(requirements_in_path)
         ]
+        # --- END OF DEFINITIVE FIX ---
+        
         result = subprocess.run(compile_cmd, capture_output=True, text=True)
         if result.returncode != 0:
             print("--> REPAIR FAILED: pip-compile could not find a theoretical solution.", file=sys.stderr)
