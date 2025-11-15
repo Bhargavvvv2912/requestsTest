@@ -145,7 +145,7 @@ class DependencyAgent:
         if os.path.exists(self.config["METRICS_OUTPUT_FILE"]):
             os.remove(self.config["METRICS_OUTPUT_FILE"])
         
-        # --- START OF "REPAIR THE BASELINE" ARCHITECTURE ---
+        # --- START OF THE FINAL "UNPIN AND BOOTSTRAP" ARCHITECTURE ---
         print("INFO: Performing Initial Baseline Health Check...")
         start_group("Initial Baseline Health Check")
         
@@ -157,16 +157,37 @@ class DependencyAgent:
         end_group()
         
         if not success:
-            print("WARNING: Initial baseline is broken. Activating 'Repair Mode'.", file=sys.stderr)
-            repair_succeeded = self._run_repair_mode(error_log)
-            if not repair_succeeded:
-                sys.exit("CRITICAL ERROR: The initial baseline is broken and could not be automatically repaired.")
-            else:
-                print("\nINFO: Baseline successfully repaired. Proceeding to normal update pass.")
+            print("WARNING: Initial baseline is broken. Activating 'Unpin and Bootstrap' repair strategy.", file=sys.stderr)
+            start_group("REPAIR MODE: Re-bootstrapping from unpinned requirements")
+
+            # Step 1: Read the broken requirements file and extract only the package names.
+            print("--> Step 1: Extracting package names from broken requirements file...")
+            package_names = []
+            with open(self.requirements_path, 'r') as f_read:
+                for line in f_read:
+                    pkg_name = self._get_package_name_from_spec(line)
+                    if pkg_name:
+                        package_names.append(pkg_name)
+            
+            # Step 2: Overwrite the requirements file with the unpinned list.
+            print(f"--> Step 2: Overwriting '{self.requirements_path.name}' with {len(package_names)} unpinned packages.")
+            with open(self.requirements_path, 'w') as f_write:
+                f_write.write("\n".join(sorted(package_names)))
+
+            # Step 3: Call the standard bootstrap method. It will now operate on the unpinned file.
+            print("\n--> Step 3: Calling bootstrap to find a new, stable, pinned baseline...")
+            # This will create a new venv, let pip resolve the unpinned list, validate it,
+            # and overwrite the requirements file with the new pinned versions.
+            self._bootstrap_unpinned_requirements()
+            
+            # After this, self.requirements_path will contain a new, provably working baseline.
+            print("\nINFO: Baseline successfully repaired. Proceeding to normal update pass.")
+            end_group()
         else:
             print("Initial baseline is valid and stable.")
-        # --- END OF "REPAIR THE BASELINE" ARCHITECTURE ---
+        # --- END OF THE FINAL ARCHITECTURE ---
 
+        # The rest of the update pass logic remains the same.
         final_successful_updates, final_failed_updates = {}, {}
         pass_num = 0
         
