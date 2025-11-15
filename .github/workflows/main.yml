@@ -115,5 +115,4 @@ jobs:
         run: pip install -r requests/requirements-dev.txt
 
       - name: Run validation (pytest) on Python ${{ matrix.python-version }}
-        # This is the final health check, running the library's own comprehensive test suite.
         run: python -m pytest requests/tests

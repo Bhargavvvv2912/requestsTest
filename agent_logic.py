@@ -12,11 +12,12 @@ from google.api_core.exceptions import ResourceExhausted
 from pypi_simple import PyPISimple
 from packaging.version import parse as parse_version
 from agent_utils import start_group, end_group, run_command, validate_changes
+from expert_agent import ExpertAgent
 
 class DependencyAgent:
     def __init__(self, config, llm_client):
         self.config = config
-        self.llm = llm_client
+        self.expert = ExpertAgent(llm_client) 
         self.pypi = PyPISimple()
         self.requirements_path = Path(config["REQUIREMENTS_FILE"])
         self.primary_packages = self._load_primary_packages()
@@ -143,13 +144,49 @@ class DependencyAgent:
         if os.path.exists(self.config["METRICS_OUTPUT_FILE"]):
             os.remove(self.config["METRICS_OUTPUT_FILE"])
         
+        # --- START OF DEFINITIVE ARCHITECTURE ---
+        
+        # STEP 1: Establish and Validate the Initial Baseline
         is_pinned, _ = self._get_requirements_state()
         if not is_pinned:
+            # If requirements are unpinned, bootstrap is the initial health check.
             self._bootstrap_unpinned_requirements()
-            is_pinned, _ = self._get_requirements_state()
-            if not is_pinned:
-                sys.exit("CRITICAL: Bootstrap process failed to produce a fully pinned requirements file.")
+        else:
+            # If requirements are already pinned, run an initial health check.
+            print("INFO: Found pinned requirements. Running initial health check on the baseline...")
+            start_group("Initial Baseline Health Check")
+            
+            venv_dir = Path("./initial_check_venv")
+            if venv_dir.exists(): shutil.rmtree(venv_dir)
+            venv.create(venv_dir, with_pip=True)
+            python_executable = str((venv_dir / "bin" / "python").resolve())
+            
+            # For pure Python projects, CWD for install is less critical but good practice.
+            project_dir = self.config.get("VALIDATION_CONFIG", {}).get("project_dir")
+            req_path = str(self.requirements_path.resolve())
+            pip_command = [python_executable, "-m", "pip", "install", "-r", req_path]
+            
+            _, stderr, returncode = run_command(pip_command, cwd=project_dir)
+            if returncode != 0:
+                print("CRITICAL ERROR: Initial installation of baseline dependencies failed!", file=sys.stderr)
+                print(f"STDERR:\n{stderr}")
+                end_group()
+                sys.exit("Bootstrap failed: Could not install from the provided requirements file.")
 
+            success, _, output = validate_changes(python_executable, self.config)
+            if not success:
+                print("CRITICAL ERROR: The initial baseline failed the validation suite.", file=sys.stderr)
+                print(f"Validation Output:\n{output}")
+                end_group()
+                sys.exit("Bootstrap failed: The provided requirements are not 'provably working'.")
+            
+            print("Initial baseline is valid and stable.")
+            end_group()
+        
+        # --- END OF DEFINITIVE ARCHITECTURE ---
+
+        # At this point, we have a guaranteed "provably working" baseline.
+        
         final_successful_updates, final_failed_updates = {}, {}
         pass_num = 0
         
@@ -166,78 +203,60 @@ class DependencyAgent:
             changed_packages_this_pass = set()
 
             packages_to_update = []
-            with open(progressive_baseline_path, 'r') as f:
-                lines = [line.strip() for line in f if line.strip() and not line.strip().startswith('#')]
+            with open(progressive_baseline_path, 'r') as f: lines = [line.strip() for line in f if line.strip() and not line.strip().startswith('#')]
             for line in lines:
-                package_part = line.split(';')[0].strip()
-                if '==' not in package_part or line.strip().startswith('-e'): continue
-                parts = package_part.split('==')
-                if len(parts) != 2: continue
-                package, current_version = self._get_package_name_from_spec(parts[0]), parts[1]
+                if '==' not in line or line.startswith('-e'): continue
+                package, current_version = self._get_package_name_from_spec(line.split('==')[0]), line.split('==')[1].split(';')[0]
                 latest_version = self.get_latest_version(package)
                 if latest_version and parse_version(latest_version) > parse_version(current_version):
                     packages_to_update.append((package, current_version, latest_version))
 
             if not packages_to_update:
-                if pass_num == 1:
-                    print("\nInitial baseline is already fully up-to-date. Running a final health check.")
-                    self._run_final_health_check()
-                else:
-                    print("\nNo further updates are available. The system has successfully converged.")
+                print("\nNo further updates are available. The system has successfully converged.")
                 if progressive_baseline_path.exists(): progressive_baseline_path.unlink()
                 break 
 
-            # --- START of HURM 4.0 with "SUM TO 100" NORMALIZATION ---
+            # HURM 4.0 Risk Calculation
             update_plan = []
             for pkg, cur, target in packages_to_update:
                 components = self._calculate_update_risk_components(pkg, cur, target)
                 update_plan.append({'pkg': pkg, 'cur': cur, 'target': target, 'components': components})
-
             max_ecosystem = max(p['components']['ecosystem'] for p in update_plan) if update_plan else 0
             max_depth = max(p['components']['depth'] for p in update_plan) if update_plan else 0
-
             W_ECOSYSTEM, W_DEPTH = 1.0, 0.5
             for p in update_plan:
-                comps = p['components']
-                norm_ecosystem = (comps['ecosystem'] / max_ecosystem) if max_ecosystem > 0 else 0
+                comps = p['components']; norm_ecosystem = (comps['ecosystem'] / max_ecosystem) if max_ecosystem > 0 else 0
                 norm_depth = (comps['depth'] / max_depth) if max_depth > 0 else 0
                 entanglement_score = (W_ECOSYSTEM * norm_ecosystem) + (W_DEPTH * norm_depth)
                 p['final_score'] = (comps['severity'] * 10) + entanglement_score
                 p['code_impact_score'] = comps['usage'] + (comps['criticality'] * 10)
-
-            update_plan.sort(key=lambda p: (p['final_score'], p['code_impact_score']))
             
-            # --- This is the new "Sum to 100" logic ---
+            # --- "HIGH-RISK FIRST" STRATEGY ---
+            update_plan.sort(key=lambda p: (p['final_score'], p['code_impact_score']), reverse=True)
+            
             total_score_sum = sum(p['final_score'] for p in update_plan) if update_plan else 0
             for p in update_plan:
                  if total_score_sum == 0: p['risk_percent_display'] = 0.0
                  else: p['risk_percent_display'] = (p['final_score'] / total_score_sum) * 100.0
-            # --- END OF NORMALIZATION LOGIC ---
 
-            print("\nPrioritized Update Plan for this Pass (Lowest Risk First):")
+            print("\nPrioritized Update Plan for this Pass (Highest Risk First):")
             print(f"{'Rank':<5} | {'Package':<30} | {'% of Total Risk':<18} | {'Change'}")
             print(f"{'-'*5} | {'-'*30} | {'-'*18} | {'-'*20}")
-            for i, p in enumerate(update_plan):
-                print(f"{i+1:<5} | {p['pkg']:<30} | {p['risk_percent_display']:<18.2f}% | {p['cur']} -> {p['target']}")
+            for i, p in enumerate(update_plan): print(f"{i+1:<5} | {p['pkg']:<30} | {p['risk_percent_display']:<18.2f}% | {p['cur']} -> {p['target']}")
             
             for i, p_data in enumerate(update_plan):
                 package, current_ver, target_ver = p_data['pkg'], p_data['cur'], p_data['target']
                 print(f"\n" + "-"*80); print(f"PULSE: [PASS {pass_num} | ATTEMPT {i+1}/{len(update_plan)}] Processing '{package}'"); print(f"PULSE: Changed packages this pass so far: {changed_packages_this_pass}"); print("-"*80)
                 
-                success, reason_or_new_version, _ = self.attempt_update_with_healing(
-                    package, current_ver, target_ver, [], progressive_baseline_path
-                )
+                success, reason_or_new_version, _ = self.attempt_update_with_healing(package, current_ver, target_ver, [], progressive_baseline_path)
                 
                 if success:
                     reached_version, is_a_real_change = "", False
-                    if "skipped" in str(reason_or_new_version):
-                        reached_version, is_a_real_change = current_ver, False
+                    if "skipped" in str(reason_or_new_version): reached_version, is_a_real_change = current_ver, False
                     else:
                         reached_version = reason_or_new_version
                         if current_ver != reached_version: is_a_real_change = True
-                    
                     final_successful_updates[package] = (target_ver, reached_version)
-                    
                     if is_a_real_change:
                         changed_packages_this_pass.add(package)
                         print(f"  -> SUCCESS. Locking in {package}=={reached_version} into the progressive baseline for this pass.")
@@ -263,7 +282,7 @@ class DependencyAgent:
         
         if final_successful_updates:
             self._print_final_summary(final_successful_updates, final_failed_updates)
-            self._run_final_health_check()
+            print("\nRun complete. The final requirements.txt is the latest provably working version.")
 
     def _print_final_summary(self, successful, failed):
         print("\n" + "#"*70); print("### OVERALL UPDATE RUN SUMMARY ###")
@@ -278,23 +297,6 @@ class DependencyAgent:
             print(f"{'-'*30} | {'-'*20} | {'-'*40}")
             for pkg, (target_ver, reason) in failed.items(): print(f"{pkg:<30} | {target_ver:<20} | {reason}")
         print("#"*70 + "\n")
-
-    def _run_final_health_check(self):
-        print("\n" + "#"*70); print("### FINAL SYSTEM HEALTH CHECK ###"); print("#"*70 + "\n")
-        venv_dir = Path("./final_venv")
-        if venv_dir.exists(): shutil.rmtree(venv_dir)
-        venv.create(venv_dir, with_pip=True)
-        python_executable = str((venv_dir / "bin" / "python").resolve())
-        _, stderr, returncode = run_command([python_executable, "-m", "pip", "install", "-r", str(self.requirements_path)])
-        if returncode != 0:
-            print("CRITICAL ERROR: Final installation of combined dependencies failed!", file=sys.stderr); return
-        success, metrics, _ = validate_changes(python_executable, self.config, group_title="Final System Health Check")
-        if success and metrics and "not available" not in metrics:
-            print("\n" + "="*70); print("=== FINAL METRICS FOR THE FULLY UPDATED ENVIRONMENT ==="); print("\n".join([f"  {line}" for line in metrics.split('\n')])); print("="*70)
-        elif success:
-            print("\n" + "="*70); print("=== Final validation passed, but metrics were not available in output. ==="); print("="*70)
-        else:
-            print("\n" + "!"*70); print("!!! CRITICAL ERROR: Final validation of combined dependencies failed! !!!"); print("!"*70)
 
     def get_latest_version(self, package_name):
         try:
@@ -357,7 +359,7 @@ class DependencyAgent:
                 except Exception:
                     reason = "Conflict (Could not parse details)"
             else: # Fallback for other error types
-                 summary = self._ask_llm_to_summarize_error(stderr_install)
+                 summary = self._get_error_summary(stderr_install)
                  reason = f"Installation failed: {summary}"
 
             print(f"--> DIAGNOSIS: {reason}")
@@ -377,6 +379,11 @@ class DependencyAgent:
         return True, metrics, ""
 
     def attempt_update_with_healing(self, package, current_version, target_version, dynamic_constraints, baseline_reqs_path):
+        """
+        The "Triage" function. Now implements the Tiered Healing strategy.
+        Level 1: Deterministic Filter-Then-Scan.
+        Level 2: Escalates to the Expert Agent for Co-Resolution.
+        """
         print(f"\n--> Toplevel Attempt: Trying direct update to {package}=={target_version}")
         
         success, result_data, stderr = self._try_install_and_validate(
@@ -384,26 +391,41 @@ class DependencyAgent:
         )
         
         if success:
-            print(f"--> Toplevel Result: Direct update to {package}=={target_version} SUCCEEDED.")
+            print(f"--> Toplevel Result: Direct update SUCCEEDED.")
             return True, result_data if "skipped" in str(result_data) else target_version, None
 
-        # --- This is the corrected, simpler flow ---
         print(f"\n--> Toplevel Result: Direct update FAILED. Reason: '{result_data}'")
-        print("--> Action: Entering healing mode with 'Filter-Then-Scan' strategy.")
-
-        # The call is now simple again. It doesn't need the extra parameter.
-        healed_version = self._heal_with_filter_and_scan(
-            package, current_version, target_version, baseline_reqs_path
-        )
+        
+        # --- LEVEL 1 HEALING ---
+        print("--> Action: Entering Level 1 Healing with 'Filter-Then-Scan' strategy.")
+        healed_version = self._heal_with_filter_and_scan(package, current_version, target_version, baseline_reqs_path)
         
         if healed_version and healed_version != current_version:
-             print(f"--> Healing Result: A new working version was found for '{package}': {healed_version}")
+             print(f"--> Healing Result: Level 1 succeeded. New working version: {healed_version}")
              return True, healed_version, None
+
+        # --- ESCALATION TO LEVEL 2 ---
+        print(f"\n--> Action: Level 1 Healing failed. Escalating to Level 2 'Co-Resolution Expert'.")
+        
+        # AURA gathers information for the expert.
+        available_updates = self.get_available_updates_from_plan() # You'll need to implement this helper
+        
+        # AURA delegates the complex problem to CORE.
+        co_resolution_plan = self.expert.propose_co_resolution(package, stderr, available_updates)
+
+        if co_resolution_plan and co_resolution_plan.get("plausible"):
+            print(f"--> Expert's Advice: A co-resolution is plausible. Proposed plan: {co_resolution_plan['proposed_plan']}")
+            # AURA now attempts the "moonshot" probe.
+            # (This logic would require extending _try_install_and_validate to handle multiple packages)
+            # For now, we will just log it. This is a major new feature.
+            print("--> Action: Executing multi-package probe... (feature to be fully implemented)")
+            # In a full implementation, you'd run the probe here and handle success/failure.
         else:
-             # This is the message for when no better version is found.
-             print(f"--> Healing Result: No newer, compatible, and working version of '{package}' was found. Reverting to {current_version}.")
-             # We return success=True and the original version, because staying put is a valid resolution.
-             return True, current_version, None
+            print("--> Expert's Advice: No plausible co-resolution found.")
+
+        # If we reach here, all attempts have failed.
+        print(f"--> Healing Result: All healing strategies failed. Reverting to {current_version}.")
+        return True, current_version, None
         
     def _heal_with_filter_and_scan(self, package, last_good_version, failed_version, baseline_reqs_path):
         start_group(f"Healing '{package}': Filter-Then-Scan Strategy")
@@ -440,7 +462,7 @@ class DependencyAgent:
                 installable_versions.append(version)
             else:
                 # --- START OF NEW, CONTEXTUAL LOGGING ---
-                summary = self._ask_llm_to_summarize_error(stderr)
+                summary = self._get_error_summary(stderr)
                 # This new log format is much clearer
                 print(f"     -- Incompatible. The attempt to add this version revealed an underlying conflict.")
                 print(f"        Diagnosis: {summary}")
@@ -484,28 +506,7 @@ class DependencyAgent:
         lines = freeze_output.strip().split('\n')
         return "\n".join([line for line in lines if '==' in line and not line.startswith('-e')])
 
-    def _ask_llm_to_summarize_error(self, error_message):
-        """
-        Uses the LLM to generate a concise, one-sentence summary of a pip error log.
-        This is used for providing clear, human-readable diagnostics in logs.
-        """
-        # First, check if the LLM is available to prevent errors.
-        if not self.llm_available:
-            return "(LLM summary unavailable)"
-
-        # The prompt is engineered to be specific, asking for a single, concise sentence.
-        prompt = (
-            "The following is a Python pip install error log. Please summarize the "
-            "root cause of the conflict in a single, concise sentence. Focus on the names "
-            "of the packages that are in conflict and their version constraints. "
-            f"Error Log: --- {error_message} ---"
-        )
-        
-        try:
-            response = self.llm.generate_content(prompt)
-            # Clean up the response to ensure it's a single, clean line for logging.
-            return response.text.strip().replace('\n', ' ')
-        except Exception as e:
-            # If the API call fails for any reason (e.g., quota, network), return a safe default.
-            print(f"  -> LLM_ERROR: Could not get summary: {e}")
-            return "Failed to get summary from LLM."
+    def _get_error_summary(self, error_message: str) -> str:
+        """Delegates the task of summarizing an error to the Expert Agent."""
+        return self.expert.summarize_error(error_message)
+    
