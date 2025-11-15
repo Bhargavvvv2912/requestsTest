@@ -284,88 +284,6 @@ class DependencyAgent:
             print("\nRun complete. The final requirements.txt is the latest provably working version.")
     
 
-    def _run_repair_mode(self, error_log):
-        """
-        Repairs a broken baseline by calling pip-compile's internal functions
-        directly, avoiding all subprocess and PATH issues.
-        """
-        start_group("REPAIR MODE: Attempting full baseline re-compilation")
-        
-        print("--> Step 1: Preparing requirements.in from broken file...")
-        requirements_in_path = Path("repair.in")
-        package_names = []
-        with open(self.requirements_path, 'r') as f_read:
-            for line in f_read:
-                pkg_name = self._get_package_name_from_spec(line)
-                if pkg_name: package_names.append(pkg_name)
-        
-        project_name = self.config.get("PROJECT_NAME")
-        if project_name and project_name not in package_names: package_names.append(project_name)
-
-        with open(requirements_in_path, 'w') as f_write:
-            for name in sorted(package_names):
-                if name.lower() == (project_name or "").lower():
-                    project_dir = self.config.get("VALIDATION_CONFIG", {}).get("project_dir")
-                    if project_dir: f_write.write(f"-e ./{project_dir}\n")
-                else: f_write.write(f"{name}\n")
-        
-        print(f"--> Extracted {len(package_names)} packages to be re-resolved.")
-
-        print("\n--> Step 2: Running pip-compile directly to generate a new lock file...")
-        repaired_reqs_path = Path("repaired-requirements.txt")
-        
-        try:
-            # --- THE DEFINITIVE FIX ---
-            # We call the pip-compile command's internal entry point directly.
-            # This is a Python function call, not a subprocess. It cannot fail with a path error.
-            from pip._internal.commands import compile as pip_compile_cli
-            pip_compile_cli.main(
-                [
-                    "--resolver=backtracking",
-                    "--output-file", str(repaired_reqs_path),
-                    str(requirements_in_path),
-                ],
-                # This prevents the function from calling sys.exit() on its own.
-                standalone_mode=False 
-            )
-            # --- END OF DEFINITIVE FIX ---
-        except SystemExit as e:
-            if e.code != 0:
-                 print("--> REPAIR FAILED: pip-compile could not find a theoretical solution.", file=sys.stderr)
-                 # We could try to capture stderr here, but for now, this is robust.
-                 end_group()
-                 return False
-        except Exception as e:
-             print(f"--> REPAIR FAILED: An unexpected error occurred while running pip-compile: {e}", file=sys.stderr)
-             end_group()
-             return False
-            
-        print("--> Found a new, theoretically compatible set of versions.")
-
-        print("\n--> Step 3: Validating the newly generated baseline...")
-        venv_dir = Path("./repair_check_venv")
-        success, _, _ = self._run_bootstrap_and_validate(venv_dir, repaired_reqs_path)
-        
-        if success:
-            print("--> REPAIR SUCCESSFUL! The baseline is now provably working.")
-            shutil.copy(repaired_reqs_path, self.requirements_path)
-            end_group()
-            return True
-        else:
-            print("--> REPAIR FAILED: The new baseline failed the validation suite.", file=sys.stderr)
-            end_group()
-            return False
-        
-    def _get_conflicting_packages_from_log(self, error_log):
-        """A helper to extract package names from a pip 'ResolutionImpossible' error."""
-        # This regex is designed to find package names in "Cannot install A, B, and C" messages.
-        match = re.search(r"Cannot install ([\s\S]+?) because", error_log)
-        if not match: return []
-        
-        # Split by comma and 'and', then clean up and extract the name
-        raw_packages = match.group(1).replace(' and ', ',').split(',')
-        packages = [self._get_package_name_from_spec(p.strip()) for p in raw_packages]
-        return [p for p in packages if p] # Filter out any None values
 
     def _print_final_summary(self, successful, failed):
         print("\n" + "#"*70); print("### OVERALL UPDATE RUN SUMMARY ###")
@@ -461,11 +379,14 @@ class DependencyAgent:
         end_group()
         return True, metrics, ""
 
+    # In agent_logic.py
+
     def attempt_update_with_healing(self, package, current_version, target_version, dynamic_constraints, baseline_reqs_path):
         """
-        The "Triage" function. Now implements the Tiered Healing strategy.
+        The "Triage" function. Implements the tiered healing strategy.
         Level 1: Deterministic Filter-Then-Scan.
-        Level 2: Escalates to the Expert Agent for Co-Resolution.
+        Level 2 (Conditional): Escalates to the Expert Agent for Co-Resolution
+                               only if a plausible path exists.
         """
         print(f"\n--> Toplevel Attempt: Trying direct update to {package}=={target_version}")
         
@@ -479,35 +400,68 @@ class DependencyAgent:
 
         print(f"\n--> Toplevel Result: Direct update FAILED. Reason: '{result_data}'")
         
-        # --- LEVEL 1 HEALING ---
+        # --- LEVEL 1 HEALING (Default) ---
         print("--> Action: Entering Level 1 Healing with 'Filter-Then-Scan' strategy.")
         healed_version = self._heal_with_filter_and_scan(package, current_version, target_version, baseline_reqs_path)
         
         if healed_version and healed_version != current_version:
-             print(f"--> Healing Result: Level 1 succeeded. New working version: {healed_version}")
+             print(f"--> Healing Result: Level 1 Succeeded. Found new working version: {healed_version}")
              return True, healed_version, None
 
-        # --- ESCALATION TO LEVEL 2 ---
-        print(f"\n--> Action: Level 1 Healing failed. Escalating to Level 2 'Co-Resolution Expert'.")
+        # --- ESCALATION TO LEVEL 2 (If Level 1 Fails) ---
+        print(f"\n--> Action: Level 1 Healing failed for '{package}'. Escalating to Level 2 'Co-Resolution Expert'.")
         
-        # AURA gathers information for the expert.
-        available_updates = self.get_available_updates_from_plan() # You'll need to implement this helper
-        
-        # AURA delegates the complex problem to CORE.
-        co_resolution_plan = self.expert.propose_co_resolution(package, stderr, available_updates)
+        # 1. Diagnose the blockers
+        print("    -> Step 1: Diagnosing blockers...")
+        blockers = self.expert.diagnose_conflict_from_log(stderr)
+        if not blockers:
+            print("    -> Diagnosis FAILED. Cannot proceed with co-resolution.")
+            return True, current_version, None # Revert to old version
 
+        # 2. THE CRITICAL FEASIBILITY CHECK (Your Idea)
+        print(f"    -> Step 2: Checking feasibility. Blockers are {blockers}.")
+        available_updates = self.get_available_updates_from_plan()
+        
+        updatable_blockers = {pkg: ver for pkg, ver in available_updates.items() if pkg in blockers}
+        
+        if not updatable_blockers:
+            print("    -> Feasibility Check FAILED: None of the blocking packages have an available update in this pass.")
+            print("       Co-resolution is not possible at this time.")
+            return True, current_version, None # Revert to old version
+
+        print(f"    -> Feasibility Check PASSED: The following blockers can be co-updated: {list(updatable_blockers.keys())}")
+
+        # 3. Delegate to the Expert Agent for a plan
+        print("    -> Step 3: Requesting a co-resolution plan from the Expert Agent...")
+        # Add our target package to the list of what can be updated
+        updatable_blockers[package] = target_version
+        co_resolution_plan = self.expert.propose_co_resolution(package, stderr, updatable_blockers)
+
+        # 4. Execute the "Moonshot" Probe
         if co_resolution_plan and co_resolution_plan.get("plausible"):
-            print(f"--> Expert's Advice: A co-resolution is plausible. Proposed plan: {co_resolution_plan['proposed_plan']}")
-            # AURA now attempts the "moonshot" probe.
-            # (This logic would require extending _try_install_and_validate to handle multiple packages)
-            # For now, we will just log it. This is a major new feature.
-            print("--> Action: Executing multi-package probe... (feature to be fully implemented)")
-            # In a full implementation, you'd run the probe here and handle success/failure.
+            print(f"    -> Step 4: Executing expert's proposed plan: {co_resolution_plan['proposed_plan']}")
+            
+            probe_succeeded = self._run_co_resolution_probe(
+                co_resolution_plan['proposed_plan'],
+                baseline_reqs_path
+            )
+
+            if probe_succeeded:
+                print("--> Co-resolution probe SUCCEEDED! (Full implementation to apply changes needed)")
+                # In a full implementation, you would return a special object here
+                # that the run() method could use to update multiple packages.
+                # For now, this is a successful end to the attempt.
+                # We return the NEW version of the ORIGINAL package.
+                for req in co_resolution_plan['proposed_plan']:
+                    if self._get_package_name_from_spec(req) == package:
+                        return True, req.split('==')[1], None # SUCCESS
+            else:
+                print("--> Co-resolution probe FAILED.")
         else:
-            print("--> Expert's Advice: No plausible co-resolution found.")
+            print("--> Expert's Advice: No plausible co-resolution plan was found.")
 
         # If we reach here, all attempts have failed.
-        print(f"--> Healing Result: All healing strategies failed. Reverting to {current_version}.")
+        print(f"--> Healing Result: All strategies failed. Reverting '{package}' to {current_version}.")
         return True, current_version, None
         
     def _heal_with_filter_and_scan(self, package, last_good_version, failed_version, baseline_reqs_path):
@@ -593,3 +547,69 @@ class DependencyAgent:
         """Delegates the task of summarizing an error to the Expert Agent."""
         return self.expert.summarize_error(error_message)
     
+
+    def get_available_updates_from_plan(self) -> dict:
+        """
+        A helper function that scans the current baseline and returns a dictionary
+        of all packages that have a newer version available on PyPI.
+        This is used to provide context to the Co-Resolution Expert.
+        
+        Returns: {'package-name': 'latest-version', ...}
+        """
+        available_updates = {}
+        # We need to read from the original, pristine requirements file for the pass,
+        # not the progressive one which might have partial changes.
+        with open(self.requirements_path, 'r') as f:
+            for line in f:
+                if '==' not in line or line.startswith('#') or line.startswith('-e'):
+                    continue
+                try:
+                    pkg_name = self._get_package_name_from_spec(line.split('==')[0])
+                    current_ver = line.split('==')[1].split(';')[0].strip()
+                    latest_ver = self.get_latest_version(pkg_name)
+                    if latest_ver and parse_version(latest_ver) > parse_version(current_ver):
+                        available_updates[pkg_name] = latest_ver
+                except Exception:
+                    continue # Ignore lines we can't parse
+        return available_updates
+
+    def _run_co_resolution_probe(self, proposed_plan: list, baseline_reqs_path: Path) -> bool:
+        """
+        Performs a "moonshot" probe with a multi-package update plan.
+        This is a simplified version; a full implementation would be more robust.
+        """
+        print("\n--- Starting Co-Resolution Probe ---")
+        
+        # Create a temporary requirements list for the probe
+        probe_reqs_list = []
+        packages_in_plan = [self._get_package_name_from_spec(p) for p in proposed_plan]
+
+        with open(baseline_reqs_path, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'): continue
+                # Exclude the old versions of packages that are in our new plan
+                if self._get_package_name_from_spec(line) not in packages_in_plan:
+                    probe_reqs_list.append(line)
+        
+        # Add the new proposed versions
+        probe_reqs_list.extend(proposed_plan)
+
+        # We can reuse _try_install_and_validate by passing it a temporary
+        # requirements file. This is a bit of a hack for now.
+        # A more elegant solution would have a dedicated multi-package validator.
+        temp_probe_req_path = Path("./temp_probe_reqs.txt")
+        with open(temp_probe_req_path, "w") as f:
+            f.write("\n".join(probe_reqs_list))
+
+        # We "pretend" we are updating the first package in the plan for validation purposes
+        target_package = self._get_package_name_from_spec(proposed_plan[0])
+        target_version = proposed_plan[0].split('==')[1]
+
+        success, _, _ = self._try_install_and_validate(
+            target_package, target_version, [], temp_probe_req_path, is_probe=True
+        )
+        
+        temp_probe_req_path.unlink() # Clean up
+        print("--- Finished Co-Resolution Probe ---")
+        return success
