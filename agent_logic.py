@@ -267,81 +267,69 @@ class DependencyAgent:
 
     def _run_repair_mode(self, error_log):
         """
-        Attempts a targeted, "surgical" repair of a broken baseline by letting pip
-        re-resolve only the conflicting packages.
+        Attempts to repair a broken baseline by unpinning ALL dependencies and
+        letting pip-compile find a new, theoretically valid lock file from scratch.
         """
-        start_group("REPAIR MODE: Attempting surgical re-resolution of baseline")
+        start_group("REPAIR MODE: Attempting full baseline re-compilation")
         
-        # --- Step 1: Diagnose the conflicting packages using the Expert Agent ---
-        print("--> Step 1: Delegating diagnosis to the Expert Agent (CORE)...")
-        conflicting_packages = self.expert.diagnose_conflict_from_log(error_log)
+        # --- Step 1: Create a simple requirements.in with only package NAMES ---
+        print("--> Step 1: Extracting all package names from the broken requirements file...")
+        requirements_in_path = Path("repair.in")
+        package_names = []
+        with open(self.requirements_path, 'r') as f_read:
+            for line in f_read:
+                # This handles both regular and editable installs correctly
+                pkg_name = self._get_package_name_from_spec(line)
+                if pkg_name:
+                    package_names.append(pkg_name)
         
-        if not conflicting_packages:
-            print("--> DIAGNOSIS FAILED: Could not determine conflicting packages. Aborting repair.", file=sys.stderr)
+        # For compilable projects, we ensure the project itself is in the list for editable install
+        project_name = self.config.get("PROJECT_NAME")
+        if project_name and project_name not in package_names:
+            package_names.append(project_name)
+
+        with open(requirements_in_path, 'w') as f_write:
+            for name in sorted(package_names):
+                if name == project_name:
+                    # The project itself must be an editable install
+                    project_dir = self.config.get("VALIDATION_CONFIG", {}).get("project_dir")
+                    f_write.write(f"-e ./{project_dir}\n")
+                else:
+                    f_write.write(f"{name}\n")
+            
+        print(f"--> Extracted {len(package_names)} packages to be re-resolved from scratch.")
+
+        # --- Step 2: Run pip-compile to find a new theoretical solution ---
+        print("\n--> Step 2: Running pip-compile to generate a new, stable lock file...")
+        repaired_reqs_path = Path("repaired-requirements.txt")
+        
+        python_executable = sys.executable
+        compile_cmd = [
+            python_executable, "-m", "piptools.scripts.compile", 
+            "--resolver=backtracking", "--output-file", str(repaired_reqs_path), 
+            str(requirements_in_path)
+        ]
+        result = subprocess.run(compile_cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            print("--> REPAIR FAILED: pip-compile could not find a theoretical solution.", file=sys.stderr)
+            print(result.stderr, file=sys.stderr)
             end_group()
             return False
+            
+        print("--> Found a new, theoretically compatible set of versions.")
 
-        print(f"--> Expert Diagnosis: Conflict involves {conflicting_packages}")
-
-        # --- Step 2: Prepare the surgical pip install command ---
-        print("\n--> Step 2: Preparing surgical installation plan...")
-        
-        good_reqs_path = Path("./good_reqs.txt")
-        unpinned_conflicts = []
-        
-        with open(self.requirements_path, 'r') as f_read, open(good_reqs_path, 'w') as f_write:
-            for line in f_read:
-                pkg_name = self._get_package_name_from_spec(line)
-                if pkg_name and pkg_name.lower() in (p.lower() for p in conflicting_packages):
-                    print(f"     - Unpinning '{pkg_name}' for re-resolution.")
-                    unpinned_conflicts.append(pkg_name)
-                else:
-                    f_write.write(line)
-
-        # --- Step 3: Execute the repair and validation in a single bootstrap run ---
-        print("\n--> Step 3: Attempting to install the repaired dependency set...")
-        
+        # --- Step 3: Validate the newly generated baseline ---
+        print("\n--> Step 3: Validating the new requirements file...")
         venv_dir = Path("./repair_check_venv")
-        if venv_dir.exists(): shutil.rmtree(venv_dir)
-        venv.create(venv_dir, with_pip=True)
-        python_executable = str((venv_dir / "bin" / "python").resolve())
-        project_dir = self.config.get("VALIDATION_CONFIG", {}).get("project_dir")
-
-        # First, install the "good" pinned dependencies
-        pip_command_good = [python_executable, "-m", "pip", "install", "-r", str(good_reqs_path.resolve())]
-        _, stderr_good, returncode_good = run_command(pip_command_good, cwd=project_dir)
-        if returncode_good != 0:
-            print(f"--> REPAIR FAILED: Could not install the 'good' part of the requirements.", file=sys.stderr)
-            print(stderr_good, file=sys.stderr)
-            end_group(); return False
-
-        # Now, ask pip to install the unpinned, conflicting packages, letting it resolve them.
-        pip_command_bad = [python_executable, "-m", "pip", "install"] + unpinned_conflicts
-        _, stderr_bad, returncode_bad = run_command(pip_command_bad, cwd=project_dir)
-        if returncode_bad != 0:
-            print(f"--> REPAIR FAILED: pip could not find a compatible resolution for the conflicting packages.", file=sys.stderr)
-            print(stderr_bad, file=sys.stderr)
-            end_group(); return False
-
-        print("--> Installation of repaired set was successful.")
-        
-        # --- Step 4: Validate the new environment and save the result ---
-        print("\n--> Step 4: Validating the new, repaired environment...")
-        success, metrics, validation_output = validate_changes(python_executable, self.config, group_title="Validating Repaired Baseline")
+        success, _, _ = self._run_bootstrap_and_validate(venv_dir, repaired_reqs_path)
         
         if success:
             print("--> REPAIR SUCCESSFUL! The baseline is now provably working.")
-            # Freeze the newly solved environment to create the new golden record.
-            installed_packages_output, _, _ = run_command([python_executable, "-m", "pip", "freeze"])
-            # (Assuming you have a _prune_pip_freeze helper)
-            repaired_packages = self._prune_pip_freeze(installed_packages_output)
-            with open(self.requirements_path, "w") as f:
-                f.write(repaired_packages)
+            shutil.copy(repaired_reqs_path, self.requirements_path)
             end_group()
             return True
         else:
-            print("--> REPAIR FAILED: The repaired environment failed the validation suite.", file=sys.stderr)
-            print(validation_output, file=sys.stderr)
+            print("--> REPAIR FAILED: The new baseline failed the validation suite.", file=sys.stderr)
             end_group()
             return False
         
