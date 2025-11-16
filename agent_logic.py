@@ -579,15 +579,26 @@ class DependencyAgent:
                     continue # Ignore lines we can't parse
         return available_updates
 
+    # In agent_logic.py
+
     def _run_co_resolution_probe(self, proposed_plan: list, baseline_reqs_path: Path) -> bool:
         """
-        Performs a "moonshot" probe with a multi-package update plan.
-        This is a simplified version; a full implementation would be more robust.
+        Performs a true multi-package probe in a clean environment to validate an
+        expert's co-resolution plan.
         """
-        print("\n--- Starting Co-Resolution Probe ---")
+        start_group(f"Co-Resolution Probe: Testing plan {proposed_plan}")
         
-        # Create a temporary requirements list for the probe
-        probe_reqs_list = []
+        # We need a clean venv for this experiment.
+        venv_dir = Path("./temp_co_res_venv")
+        if venv_dir.exists(): shutil.rmtree(venv_dir)
+        venv.create(venv_dir, with_pip=True)
+        python_executable = str((venv_dir / "bin" / "python").resolve())
+        project_dir = self.config["VALIDATION_CONFIG"].get("project_dir")
+        
+        # --- Stage 1: Install the correctly modified dependency set ---
+        print("--> Stage 1: Installing the proposed co-resolution dependency set...")
+        
+        requirements_list = []
         packages_in_plan = [self._get_package_name_from_spec(p) for p in proposed_plan]
 
         with open(baseline_reqs_path, 'r') as f:
@@ -596,26 +607,39 @@ class DependencyAgent:
                 if not line or line.startswith('#'): continue
                 # Exclude the old versions of packages that are in our new plan
                 if self._get_package_name_from_spec(line) not in packages_in_plan:
-                    probe_reqs_list.append(line)
+                    requirements_list.append(line)
         
         # Add the new proposed versions
-        probe_reqs_list.extend(proposed_plan)
-
-        # We can reuse _try_install_and_validate by passing it a temporary
-        # requirements file. This is a bit of a hack for now.
-        # A more elegant solution would have a dedicated multi-package validator.
-        temp_probe_req_path = Path("./temp_probe_reqs.txt")
-        with open(temp_probe_req_path, "w") as f:
-            f.write("\n".join(probe_reqs_list))
-
-        # We "pretend" we are updating the first package in the plan for validation purposes
-        target_package = self._get_package_name_from_spec(proposed_plan[0])
-        target_version = proposed_plan[0].split('==')[1]
-
-        success, _, _ = self._try_install_and_validate(
-            target_package, target_version, [], temp_probe_req_path, is_probe=True
-        )
+        requirements_list.extend(proposed_plan)
         
-        temp_probe_req_path.unlink() # Clean up
-        print("--- Finished Co-Resolution Probe ---")
-        return success
+        pip_command_tools = [python_executable, "-m", "pip", "install"] + requirements_list
+        _, stderr_install, returncode = run_command(pip_command_tools, cwd=project_dir)
+        
+        if returncode != 0:
+            print("--> ERROR: Co-resolution installation failed.")
+            summary = self._ask_llm_to_summarize_error(stderr_install)
+            print(f"    Diagnosis: {summary}")
+            end_group()
+            return False
+
+        # --- Stage 2: Build and Install the Project ---
+        print("\n--> Stage 2: Building and installing the project...")
+        build_install_command = [python_executable, "-m", "pip", "install", f"./{project_dir}"]
+        _, stderr_build, returncode_build = run_command(build_install_command, cwd=project_dir)
+        if returncode_build != 0:
+            print("--> ERROR: Project build/install failed with the co-resolution set.")
+            end_group()
+            return False
+
+        # --- Stage 3: Run Validation ---
+        print("\n--> Stage 3: Running validation suite on the co-resolution set...")
+        success, _, _ = validate_changes(python_executable, self.config, group_title="Validating Co-Resolution Plan")
+        
+        if not success:
+            print("--> ERROR: Validation failed for the co-resolution set.")
+            end_group()
+            return False
+
+        print("--> SUCCESS: The co-resolution plan is provably working.")
+        end_group()
+        return True
