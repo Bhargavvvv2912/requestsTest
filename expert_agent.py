@@ -49,51 +49,42 @@ class ExpertAgent:
             print(f"  -> LLM_ERROR: Could not get summary: {e}")
             return "Failed to get summary from LLM."
 
+    # In expert_agent.py
+
     def propose_co_resolution(self, target_package: str, error_log: str, available_updates: dict) -> dict | None:
         """
-        Analyzes a complex conflict and proposes a multi-package "moonshot" update.
-        Responds with a structured plan if a plausible solution is found.
+        Analyzes a complex conflict using the full error log and proposes a 
+        multi-package "moonshot" update from a list of available versions.
         """
         if not self.llm_available: return None
 
-        # --- IMPROVEMENT #1: Extract key constraints for a focused prompt ---
-        key_constraints = self._extract_key_constraints(error_log)
-        if not key_constraints:
-             # If we can't find specific constraints, the error is too generic to solve.
-             print("  -> Expert Agent: The error log is too generic. Cannot propose a co-resolution.")
-             return None
-
-        # --- IMPROVEMENT #2: Provide "Oracle Metadata" of available versions ---
-        # available_updates is now a dict: {'package_name': 'latest_version'}
         update_options_str = json.dumps(available_updates, indent=2)
 
         prompt = f"""
         You are an expert Python dependency conflict resolver named CORE.
-        Your task is to propose a multi-package update to fix a conflict.
+        Your task is to analyze a failed dependency update and determine if a
+        multi-package co-resolution is a plausible solution.
         Respond ONLY with a valid JSON object with the keys "plausible" (boolean) and "proposed_plan" (a list of 'package==version' strings).
 
         ANALYSIS CONTEXT:
-        1. The primary goal was to update the package: '{target_package}'.
-        2. The attempt failed due to the following specific constraints:
-           --- KEY CONSTRAINTS ---
-           {key_constraints}
-           --- END KEY CONSTRAINTS ---
-        3. The following packages have updates available. YOU MUST CHOOSE FROM THIS LIST:
-           --- AVAILABLE UPDATES (ORACLE METADATA) ---
-           {update_options_str}
-           --- END AVAILABLE UPDATES ---
+        1.  The primary goal was to update the package: '{target_package}'.
+        2.  The attempt failed. The full error log from pip's resolver is below. This log contains the deep, transitive dependency conflicts.
+            --- FULL ERROR LOG ---
+            {error_log}
+            --- END FULL ERROR LOG ---
+        3.  The following packages have updates available. Your proposed plan MUST ONLY use package names and versions from this list.
+            --- AVAILABLE UPDATES (ORACLE METADATA) ---
+            {update_options_str}
+            --- END AVAILABLE UPDATES ---
 
         YOUR TASK:
-        Based on the key constraints, is it plausible that updating one or more of the related packages
-        *along with* '{target_package}' would solve the conflict? If so, construct the
-        most likely plan using the versions provided in the AVAILABLE UPDATES.
+        Carefully analyze the FULL ERROR LOG to understand the root cause of the conflict. Based on your analysis, is it plausible that updating one or more of the packages from the AVAILABLE UPDATES list *along with* '{target_package}' would solve the conflict?
+        
+        If it is plausible, construct the most likely plan. The plan must include the original '{target_package}' (with its version from the AVAILABLE UPDATES list) and any other necessary packages from the list.
 
-        EXAMPLE RESPONSE:
-        {{
-            "plausible": true,
-            "proposed_plan": ["{target_package}==<version_from_list>", "related_package_A==<version_from_list>"]
-        }}
+        If you cannot determine a plausible path from the log, or if the log indicates the conflict is with a package that cannot be updated, respond that it is not plausible.
         """
+
         try:
             response = self.llm.generate_content(prompt)
             match = re.search(r'\{.*\}', response.text, re.DOTALL)
@@ -103,19 +94,21 @@ class ExpertAgent:
             
             plan = json.loads(match.group(0))
             if isinstance(plan.get("plausible"), bool) and isinstance(plan.get("proposed_plan"), list):
-                # We can add a final check here to ensure the LLM didn't hallucinate.
+                # Final check to ensure the LLM didn't hallucinate a version or package
                 for requirement in plan.get("proposed_plan", []):
-                    pkg, ver = requirement.split('==')
-                    if pkg not in available_updates or ver != available_updates[pkg]:
-                        print(f"  -> LLM_WARNING: Plan contains a hallucinated or incorrect version: {requirement}")
-                        return None
+                    try:
+                        pkg, ver = requirement.split('==')
+                        if pkg not in available_updates or ver != available_updates[pkg]:
+                            print(f"  -> LLM_WARNING: Plan contains a hallucinated or incorrect version: {requirement}")
+                            return {"plausible": False, "proposed_plan": []}
+                    except ValueError:
+                         print(f"  -> LLM_WARNING: Plan contains an invalid requirement format: {requirement}")
+                         return {"plausible": False, "proposed_plan": []}
                 return plan
             return None
         except (json.JSONDecodeError, AttributeError, Exception) as e:
             print(f"  -> LLM_ERROR: Could not get/parse co-resolution plan: {e}")
             return None
-        
-        # In expert_agent.py
 
     def diagnose_conflict_from_log(self, error_log: str) -> list[str]:
         """

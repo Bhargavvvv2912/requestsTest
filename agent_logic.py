@@ -381,9 +381,11 @@ class DependencyAgent:
 
     # In agent_logic.py
 
+    # In agent_logic.py
+
     def attempt_update_with_healing(self, package, current_version, target_version, dynamic_constraints, baseline_reqs_path):
         """
-        The "Triage" function. Implements the tiered healing strategy.
+        The "Triage" function. Implements the tiered healing strategy with the Feasibility Check.
         Level 1: Deterministic Filter-Then-Scan.
         Level 2 (Conditional): Escalates to the Expert Agent for Co-Resolution
                                only if a plausible path exists.
@@ -416,24 +418,30 @@ class DependencyAgent:
         blockers = self.expert.diagnose_conflict_from_log(stderr)
         if not blockers:
             print("    -> Diagnosis FAILED. Cannot proceed with co-resolution.")
-            return True, current_version, None # Revert to old version
+            return True, current_version, None
 
-        # 2. THE CRITICAL FEASIBILITY CHECK (Your Idea)
-        print(f"    -> Step 2: Checking feasibility. Blockers are {blockers}.")
+        # 2. THE CRITICAL FEASIBILITY CHECK
+        print(f"    -> Step 2: Checking feasibility. Diagnosed blockers are {blockers}.")
         available_updates = self.get_available_updates_from_plan()
         
-        updatable_blockers = {pkg: ver for pkg, ver in available_updates.items() if pkg in blockers}
+        # Find blockers that are NOT the package we're currently trying to heal.
+        other_blockers = [b for b in blockers if b.lower() != package.lower()]
+        
+        updatable_blockers = {
+            pkg: ver for pkg, ver in available_updates.items() 
+            if pkg in other_blockers
+        }
         
         if not updatable_blockers:
-            print("    -> Feasibility Check FAILED: None of the blocking packages have an available update in this pass.")
-            print("       Co-resolution is not possible at this time.")
+            print("    -> Feasibility Check FAILED: None of the *other* blocking packages have an available update.")
+            print("       A meaningful co-resolution is not possible at this time.")
             return True, current_version, None # Revert to old version
 
-        print(f"    -> Feasibility Check PASSED: The following blockers can be co-updated: {list(updatable_blockers.keys())}")
+        print(f"    -> Feasibility Check PASSED: The following other blockers can be co-updated: {list(updatable_blockers.keys())}")
 
         # 3. Delegate to the Expert Agent for a plan
         print("    -> Step 3: Requesting a co-resolution plan from the Expert Agent...")
-        # Add our target package to the list of what can be updated
+        # Add our target package to the list of what can be updated for the expert's context
         updatable_blockers[package] = target_version
         co_resolution_plan = self.expert.propose_co_resolution(package, stderr, updatable_blockers)
 
@@ -447,21 +455,19 @@ class DependencyAgent:
             )
 
             if probe_succeeded:
-                print("--> Co-resolution probe SUCCEEDED! (Full implementation to apply changes needed)")
-                # In a full implementation, you would return a special object here
-                # that the run() method could use to update multiple packages.
-                # For now, this is a successful end to the attempt.
-                # We return the NEW version of the ORIGINAL package.
+                print("--> Co-resolution probe SUCCEEDED! (Logic to apply changes to be implemented)")
+                # For now, we'll just return the new version of the original package.
+                # A full implementation would need to update the state for all packages in the plan.
                 for req in co_resolution_plan['proposed_plan']:
                     if self._get_package_name_from_spec(req) == package:
-                        return True, req.split('==')[1], None # SUCCESS
+                        return True, req.split('==')[1], None
             else:
                 print("--> Co-resolution probe FAILED.")
         else:
-            print("--> Expert's Advice: No plausible co-resolution plan was found.")
+            print("    -> Expert's Advice: No plausible co-resolution plan was found.")
 
         # If we reach here, all attempts have failed.
-        print(f"--> Healing Result: All strategies failed. Reverting '{package}' to {current_version}.")
+        print(f"--> Healing Result: All strategies for '{package}' failed. Reverting to {current_version}.")
         return True, current_version, None
         
     def _heal_with_filter_and_scan(self, package, last_good_version, failed_version, baseline_reqs_path):
