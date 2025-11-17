@@ -607,7 +607,7 @@ class DependencyAgent:
         
         if returncode != 0:
             print("--> ERROR: Co-resolution installation failed.")
-            summary = self._ask_llm_to_summarize_error(stderr_install)
+            summary = self.expert.summarize_error(stderr_install)
             print(f"    Diagnosis: {summary}")
             end_group()
             return False
