@@ -118,35 +118,53 @@ class DependencyAgent:
         start_group("View Initial Baseline Failure Log"); print(error_log); end_group()
         sys.exit("CRITICAL ERROR: Bootstrap failed. Please provide a working set of requirements.")
     
-   # In agent_logic.py
-
     def _run_bootstrap_and_validate(self, venv_dir, requirements_source):
         python_executable = str((venv_dir / "bin" / "python").resolve())
         project_dir = self.config.get("VALIDATION_CONFIG", {}).get("project_dir")
-        test_reqs_path = self.config.get("TEST_REQUIREMENTS_FILE")
+        test_reqs_path_str = self.config.get("TEST_REQUIREMENTS_FILE")
 
         # --- The Definitive "Two-File" Bootstrap ---
-        # STEP 1: Install the project using its high-level requirement file (e.g., containing '-e .[socks]').
+        # STEP 1: Install the main requirements file (e.g., containing '-e .[socks]').
         print(f"--> Bootstrap Step 1: Installing project from '{requirements_source.name}'...")
         req_path = str(requirements_source.resolve())
         pip_command_main = [python_executable, "-m", "pip", "install", "-r", req_path]
         
-        # CWD must be the root for '-e ./{project_dir}' to work.
         _, stderr_main, returncode_main = run_command(pip_command_main, cwd=".")
         if returncode_main != 0:
             return False, None, f"Failed to install project and its core dependencies. Error: {stderr_main}"
 
-        # STEP 2: Freeze the environment to capture the resolved CORE dependencies.
-        # This is the crucial step to create our initial, fully-pinned Golden Record.
-        print("\n--> Bootstrap Step 2: Freezing the resolved core dependencies...")
-        core_packages_output, _, _ = run_command([python_executable, "-m", "pip", "freeze"])
-        # The prune function MUST preserve the '-e' line.
-        core_packages = self._prune_pip_freeze(core_packages_output)
+        # --- START OF THE DEFINITIVE FIX ---
+        # STEP 2: Freeze the environment to capture ONLY the resolved dependencies.
+        print("\n--> Bootstrap Step 2: Freezing the resolved dependencies (excluding the project itself)...")
+        # We run 'pip freeze' and then use our (soon to be corrected) prune function.
+        full_freeze_output, _, _ = run_command([python_executable, "-m", "pip", "freeze"])
         
-        # STEP 3: Now, install the static testing toolchain on top of the core deps.
-        if test_reqs_path and Path(test_reqs_path).exists():
-            print(f"\n--> Bootstrap Step 3: Installing testing toolchain from '{test_reqs_path}'...")
-            pip_command_test = [python_executable, "-m", "pip", "install", "-r", str(Path(test_reqs_path).resolve())]
+        # This prune step is now critical. It MUST strip the '-e' line.
+        core_packages = self._prune_pip_freeze(full_freeze_output)
+
+        # To be extra robust, let's write these core packages to a temporary file
+        # and install them again, to ensure the environment is perfectly clean before testing.
+        temp_core_reqs_path = venv_dir / "frozen_core_reqs.txt"
+        with open(temp_core_reqs_path, "w") as f:
+            f.write(core_packages)
+        
+        pip_reinstall_core = [python_executable, "-m", "pip", "install", "--force-reinstall", "-r", str(temp_core_reqs_path.resolve())]
+        _, stderr_reinstall, returncode_reinstall = run_command(pip_reinstall_core)
+        if returncode_reinstall != 0:
+            return False, None, f"Failed to create a clean environment from frozen dependencies. Error: {stderr_reinstall}"
+        
+        # Now, re-install the project itself on top of the clean, pinned core dependencies.
+        pip_command_project = [python_executable, "-m", "pip", "install", f"-e ./{project_dir}[socks]"]
+        _, stderr_project, returncode_project = run_command(pip_command_project, cwd=".")
+        if returncode_project != 0:
+            return False, None, f"Failed to re-install project on top of frozen dependencies. Error: {stderr_project}"
+        # --- END OF THE DEFINITIVE FIX ---
+        
+        # STEP 3: Install the static testing toolchain.
+        if test_reqs_path_str and Path(test_reqs_path_str).exists():
+            print(f"\n--> Bootstrap Step 3: Installing testing toolchain from '{test_reqs_path_str}'...")
+            test_reqs_path = str(Path(test_reqs_path_str).resolve())
+            pip_command_test = [python_executable, "-m", "pip", "install", "-r", test_reqs_path]
             _, stderr_test, returncode_test = run_command(pip_command_test, cwd=".")
             if returncode_test != 0:
                 return False, None, f"Failed to install test dependencies. Error: {stderr_test}"
@@ -157,7 +175,7 @@ class DependencyAgent:
         if not success:
             return False, None, validation_output
             
-        # If everything passes, we return the CLEAN, core-only packages to be saved.
+        # If everything passes, we return the CLEAN, CORE-ONLY packages to be saved as the new Golden Record.
         return True, {"metrics": metrics, "packages": core_packages}, None
 
     def run(self):
@@ -324,8 +342,6 @@ class DependencyAgent:
             stable_versions = [p.version for p in package_info.packages if p.version and not parse_version(p.version).is_prerelease]
             return max(stable_versions, key=parse_version) if stable_versions else max([p.version for p in package_info.packages if p.version], key=parse_version)
         except Exception: return None
-
-    # In agent_logic.py
 
     def _try_install_and_validate(self, package_to_update, new_version, dynamic_constraints, baseline_reqs_path, is_probe):
         # This function must now also follow the robust "Two-File" installation process
@@ -550,24 +566,23 @@ class DependencyAgent:
             return sorted(candidate_versions, key=parse_version)
         except Exception: return []
 
-
     def _prune_pip_freeze(self, freeze_output):
         """
-        Cleans 'pip freeze' output, preserving standard pins ('==') and
-        essential editable install lines ('-e').
+        Cleans 'pip freeze' output for the bootstrap process. It now intentionally
+        strips the editable install line to create a clean lock file of dependencies ONLY.
         """
         lines = freeze_output.strip().split('\n')
         
+        # --- THE DEFINITIVE FIX ---
+        # Keep ONLY the lines that are standard '==' pins.
+        # This correctly and intentionally REMOVES the '-e' line.
         pruned_lines = [
             line for line in lines 
-            if '==' in line or line.strip().startswith('-e')
+            if '==' in line and not line.strip().startswith('-e')
         ]
-        
-        editable_lines = sorted([line for line in pruned_lines if line.startswith('-e')])
-        pinned_lines = sorted([line for line in pruned_lines if '==' in line])
+        # --- END OF THE DEFINITIVE FIX ---
 
-        # Return a sorted, clean list with editable installs first.
-        return "\n".join(editable_lines + pinned_lines)
+        return "\n".join(sorted(pruned_lines))
     
     def _get_error_summary(self, error_message: str) -> str:
         """Delegates the task of summarizing an error to the Expert Agent."""
