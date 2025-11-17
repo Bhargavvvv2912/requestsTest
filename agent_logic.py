@@ -118,65 +118,52 @@ class DependencyAgent:
         start_group("View Initial Baseline Failure Log"); print(error_log); end_group()
         sys.exit("CRITICAL ERROR: Bootstrap failed. Please provide a working set of requirements.")
     
+    # In agent_logic.py
+
     def _run_bootstrap_and_validate(self, venv_dir, requirements_source):
+        """
+        Correctly implements the 'Two-File' installation strategy in a robust manner.
+        """
         python_executable = str((venv_dir / "bin" / "python").resolve())
         project_dir = self.config.get("VALIDATION_CONFIG", {}).get("project_dir")
         test_reqs_path_str = self.config.get("TEST_REQUIREMENTS_FILE")
 
-        # --- The Definitive "Two-File" Bootstrap ---
-        # STEP 1: Install the main requirements file (e.g., containing '-e .[socks]').
-        print(f"--> Bootstrap Step 1: Installing project from '{requirements_source.name}'...")
+        # --- THE DEFINITIVE, CORRECT "TWO-FILE" INSTALL ---
+        # CWD should be the root for all commands to ensure relative paths are correct.
+        CWD = "."
+        
+        # STEP 1: Install the project and its core dependencies from the DEV file.
+        # This file contains the '-e ./requests_repo[socks]' line.
+        print(f"--> Bootstrap Step 1: Installing project and core dependencies from '{requirements_source.name}'...")
         req_path = str(requirements_source.resolve())
         pip_command_main = [python_executable, "-m", "pip", "install", "-r", req_path]
         
-        _, stderr_main, returncode_main = run_command(pip_command_main, cwd=".")
+        _, stderr_main, returncode_main = run_command(pip_command_main, cwd=CWD)
         if returncode_main != 0:
-            return False, None, f"Failed to install project and its core dependencies. Error: {stderr_main}"
+            return False, None, f"Failed to install main project dependencies. Error: {stderr_main}"
 
-        # --- START OF THE DEFINITIVE FIX ---
-        # STEP 2: Freeze the environment to capture ONLY the resolved dependencies.
-        print("\n--> Bootstrap Step 2: Freezing the resolved dependencies (excluding the project itself)...")
-        # We run 'pip freeze' and then use our (soon to be corrected) prune function.
-        full_freeze_output, _, _ = run_command([python_executable, "-m", "pip", "freeze"])
-        
-        # This prune step is now critical. It MUST strip the '-e' line.
-        core_packages = self._prune_pip_freeze(full_freeze_output)
-
-        # To be extra robust, let's write these core packages to a temporary file
-        # and install them again, to ensure the environment is perfectly clean before testing.
-        temp_core_reqs_path = venv_dir / "frozen_core_reqs.txt"
-        with open(temp_core_reqs_path, "w") as f:
-            f.write(core_packages)
-        
-        pip_reinstall_core = [python_executable, "-m", "pip", "install", "--force-reinstall", "-r", str(temp_core_reqs_path.resolve())]
-        _, stderr_reinstall, returncode_reinstall = run_command(pip_reinstall_core)
-        if returncode_reinstall != 0:
-            return False, None, f"Failed to create a clean environment from frozen dependencies. Error: {stderr_reinstall}"
-        
-        # Now, re-install the project itself on top of the clean, pinned core dependencies.
-        pip_command_project = [python_executable, "-m", "pip", "install", f"-e ./{project_dir}[socks]"]
-        _, stderr_project, returncode_project = run_command(pip_command_project, cwd=".")
-        if returncode_project != 0:
-            return False, None, f"Failed to re-install project on top of frozen dependencies. Error: {stderr_project}"
-        # --- END OF THE DEFINITIVE FIX ---
-        
-        # STEP 3: Install the static testing toolchain.
+        # STEP 2: Install the static testing toolchain into the same environment.
         if test_reqs_path_str and Path(test_reqs_path_str).exists():
-            print(f"\n--> Bootstrap Step 3: Installing testing toolchain from '{test_reqs_path_str}'...")
+            print(f"\n--> Bootstrap Step 2: Installing testing toolchain from '{test_reqs_path_str}'...")
             test_reqs_path = str(Path(test_reqs_path_str).resolve())
             pip_command_test = [python_executable, "-m", "pip", "install", "-r", test_reqs_path]
-            _, stderr_test, returncode_test = run_command(pip_command_test, cwd=".")
+            _, stderr_test, returncode_test = run_command(pip_command_test, cwd=CWD)
             if returncode_test != 0:
                 return False, None, f"Failed to install test dependencies. Error: {stderr_test}"
         
-        # STEP 4: Validate the complete environment.
-        print("\n--> Bootstrap Step 4: Running validation suite...")
-        success, metrics, validation_output = validate_changes(python_executable, self.config, group_title="Running Validation on New Baseline")
+        # --- END OF DEFINITIVE "TWO-FILE" INSTALL ---
+
+        print("\n--> Bootstrap Step 3: Running validation suite...")
+        success, metrics, validation_output = validate_changes(python_executable, self.config)
         if not success:
             return False, None, validation_output
             
-        # If everything passes, we return the CLEAN, CORE-ONLY packages to be saved as the new Golden Record.
-        return True, {"metrics": metrics, "packages": core_packages}, None
+        # Freeze the environment.
+        installed_packages_output, _, _ = run_command([python_executable, "-m", "pip", "freeze"])
+        # The prune function MUST correctly preserve the '-e' line from the freeze output.
+        final_packages = self._prune_pip_freeze(installed_packages_output)
+
+        return True, {"metrics": metrics, "packages": final_packages}, None
 
     def run(self):
         if os.path.exists(self.config["METRICS_OUTPUT_FILE"]):
