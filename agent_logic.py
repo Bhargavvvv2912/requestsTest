@@ -118,46 +118,47 @@ class DependencyAgent:
         start_group("View Initial Baseline Failure Log"); print(error_log); end_group()
         sys.exit("CRITICAL ERROR: Bootstrap failed. Please provide a working set of requirements.")
     
-    # In agent_logic.py
+   # In agent_logic.py
 
     def _run_bootstrap_and_validate(self, venv_dir, requirements_source):
         python_executable = str((venv_dir / "bin" / "python").resolve())
         project_dir = self.config.get("VALIDATION_CONFIG", {}).get("project_dir")
-        test_reqs_path_str = self.config.get("TEST_REQUIREMENTS_FILE")
+        test_reqs_path = self.config.get("TEST_REQUIREMENTS_FILE")
 
-        # --- START OF DEFINITIVE "TWO-FILE" INSTALL LOGIC ---
-        # The Current Working Directory for ALL commands will be the root.
-        CWD = "." 
-        
-        # STEP 1: Install the main requirements file (the Golden Record).
-        print(f"--> Bootstrap Step 1: Installing main dependencies from '{requirements_source.name}'...")
+        # --- The Definitive "Two-File" Bootstrap ---
+        # STEP 1: Install the project using its high-level requirement file (e.g., containing '-e .[socks]').
+        print(f"--> Bootstrap Step 1: Installing project from '{requirements_source.name}'...")
         req_path = str(requirements_source.resolve())
         pip_command_main = [python_executable, "-m", "pip", "install", "-r", req_path]
-        _, stderr_main, returncode_main = run_command(pip_command_main, cwd=CWD)
+        
+        # CWD must be the root for '-e ./{project_dir}' to work.
+        _, stderr_main, returncode_main = run_command(pip_command_main, cwd=".")
         if returncode_main != 0:
-            return False, None, f"Failed to install main dependencies. Error: {stderr_main}"
+            return False, None, f"Failed to install project and its core dependencies. Error: {stderr_main}"
 
-        # STEP 2: Install the static testing toolchain.
-        if test_reqs_path_str and Path(test_reqs_path_str).exists():
-            print(f"\n--> Bootstrap Step 2: Installing testing toolchain from '{test_reqs_path_str}'...")
-            test_reqs_path = str(Path(test_reqs_path_str).resolve())
-            pip_command_test = [python_executable, "-m", "pip", "install", "-r", test_reqs_path]
-            _, stderr_test, returncode_test = run_command(pip_command_test, cwd=CWD)
+        # STEP 2: Freeze the environment to capture the resolved CORE dependencies.
+        # This is the crucial step to create our initial, fully-pinned Golden Record.
+        print("\n--> Bootstrap Step 2: Freezing the resolved core dependencies...")
+        core_packages_output, _, _ = run_command([python_executable, "-m", "pip", "freeze"])
+        # The prune function MUST preserve the '-e' line.
+        core_packages = self._prune_pip_freeze(core_packages_output)
+        
+        # STEP 3: Now, install the static testing toolchain on top of the core deps.
+        if test_reqs_path and Path(test_reqs_path).exists():
+            print(f"\n--> Bootstrap Step 3: Installing testing toolchain from '{test_reqs_path}'...")
+            pip_command_test = [python_executable, "-m", "pip", "install", "-r", str(Path(test_reqs_path).resolve())]
+            _, stderr_test, returncode_test = run_command(pip_command_test, cwd=".")
             if returncode_test != 0:
                 return False, None, f"Failed to install test dependencies. Error: {stderr_test}"
-        # --- END OF DEFINITIVE "TWO-FILE" INSTALL LOGIC ---
-
-        print("\n--> Bootstrap Step 3: Running validation suite...")
+        
+        # STEP 4: Validate the complete environment.
+        print("\n--> Bootstrap Step 4: Running validation suite...")
         success, metrics, validation_output = validate_changes(python_executable, self.config, group_title="Running Validation on New Baseline")
         if not success:
             return False, None, validation_output
             
-        installed_packages_output, _, _ = run_command([python_executable, "-m", "pip", "freeze"])
-        final_packages = self._prune_pip_freeze(installed_packages_output)
-
-        return True, {"metrics": metrics, "packages": final_packages}, None
-
-    # In agent_logic.py
+        # If everything passes, we return the CLEAN, core-only packages to be saved.
+        return True, {"metrics": metrics, "packages": core_packages}, None
 
     def run(self):
         if os.path.exists(self.config["METRICS_OUTPUT_FILE"]):
@@ -302,7 +303,6 @@ class DependencyAgent:
             print("\nRun complete. The final requirements.txt is the latest provably working version.")
     
 
-
     def _print_final_summary(self, successful, failed):
         print("\n" + "#"*70); print("### OVERALL UPDATE RUN SUMMARY ###")
         if successful:
@@ -328,6 +328,9 @@ class DependencyAgent:
     # In agent_logic.py
 
     def _try_install_and_validate(self, package_to_update, new_version, dynamic_constraints, baseline_reqs_path, is_probe):
+        # This function must now also follow the robust "Two-File" installation process
+        # to ensure perfect consistency with the bootstrap environment.
+        
         start_group(f"Probe: Install & Validate for {package_to_update}=={new_version}")
         
         venv_dir = Path("./temp_venv")
@@ -340,40 +343,46 @@ class DependencyAgent:
         CWD = "."
 
         # --- Stage 1: Install the proposed CORE dependency set ---
-        print("--> Stage 1: Installing the proposed core dependency set...")
+        print("--> Probe Step 1: Installing the proposed core dependency set...")
         
-        # Create a temporary requirements file for the probe
-        temp_reqs_path = venv_dir / "probe_reqs.txt"
-        with open(baseline_reqs_path, "r") as f_read, open(temp_reqs_path, "w") as f_write:
+        # Create a temporary requirements file for this specific probe.
+        temp_core_reqs_path = venv_dir / "probe_core_reqs.txt"
+        with open(baseline_reqs_path, "r") as f_read, open(temp_core_reqs_path, "w") as f_write:
              for line in f_read:
                 line = line.strip()
                 if not line or line.startswith('#'): continue
+                
+                # Check for the package by name and replace its line with the new version.
+                # This handles both `==` and `-e` lines that might contain the name.
                 if self._get_package_name_from_spec(line) == package_to_update:
                     f_write.write(f"{package_to_update}=={new_version}\n")
                 else:
                     f_write.write(f"{line}\n")
 
-        pip_command_core = [python_executable, "-m", "pip", "install", "-r", str(temp_reqs_path.resolve())]
+        pip_command_core = [python_executable, "-m", "pip", "install", "-r", str(temp_core_reqs_path.resolve())]
         _, stderr_install, returncode_core = run_command(pip_command_core, cwd=CWD)
         if returncode_core != 0:
             summary = self._get_error_summary(stderr_install)
-            end_group(); return False, f"Core dependency installation failed: {summary}", stderr_install
+            end_group()
+            return False, f"Core dependency installation failed: {summary}", stderr_install
 
         # --- Stage 2: Install the static testing toolchain ---
         if test_reqs_path_str and Path(test_reqs_path_str).exists():
-            print("\n--> Stage 2: Installing testing toolchain...")
+            print("\n--> Probe Step 2: Installing testing toolchain...")
             test_reqs_path = str(Path(test_reqs_path_str).resolve())
             pip_command_test = [python_executable, "-m", "pip", "install", "-r", test_reqs_path]
             _, stderr_test, returncode_test = run_command(pip_command_test, cwd=CWD)
             if returncode_test != 0:
                  summary = self._get_error_summary(stderr_test)
-                 end_group(); return False, f"Test dependency installation failed: {summary}", stderr_test
+                 end_group()
+                 return False, f"Test dependency installation failed: {summary}", stderr_test
 
         # --- Stage 3: Run Validation ---
-        print("\n--> Stage 3: Running validation suite...")
+        print("\n--> Probe Step 3: Running validation suite...")
         success, metrics, validation_output = validate_changes(python_executable, self.config, group_title=f"Running Validation")
         if not success:
-            end_group(); return False, "Validation script failed", validation_output
+            end_group()
+            return False, "Validation script failed", validation_output
 
         print("--> SUCCESS: Installation and validation passed for this probe.")
         end_group()
@@ -541,31 +550,25 @@ class DependencyAgent:
             return sorted(candidate_versions, key=parse_version)
         except Exception: return []
 
-    # In agent_logic.py
 
     def _prune_pip_freeze(self, freeze_output):
         """
-        Cleans the output of 'pip freeze', preserving both standard pinned
-        dependencies and essential editable install lines.
+        Cleans 'pip freeze' output, preserving standard pins ('==') and
+        essential editable install lines ('-e').
         """
         lines = freeze_output.strip().split('\n')
         
-        # --- START OF DEFINITIVE FIX ---
-        # A line is kept if it is a standard pin ('==') OR if it's an editable install ('-e').
-        # This correctly handles both types of requirements we need.
         pruned_lines = [
             line for line in lines 
             if '==' in line or line.strip().startswith('-e')
         ]
-        # --- END OF DEFINITIVE FIX ---
         
-        # It's good practice to sort the output for consistency.
-        # We can sort editable installs to the top if they exist.
         editable_lines = sorted([line for line in pruned_lines if line.startswith('-e')])
-        pinned_lines = sorted([line for line in pruned_lines if not line.startswith('-e')])
+        pinned_lines = sorted([line for line in pruned_lines if '==' in line])
 
+        # Return a sorted, clean list with editable installs first.
         return "\n".join(editable_lines + pinned_lines)
-
+    
     def _get_error_summary(self, error_message: str) -> str:
         """Delegates the task of summarizing an error to the Expert Agent."""
         return self.expert.summarize_error(error_message)
