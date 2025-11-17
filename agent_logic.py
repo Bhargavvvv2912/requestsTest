@@ -118,28 +118,44 @@ class DependencyAgent:
         start_group("View Initial Baseline Failure Log"); print(error_log); end_group()
         sys.exit("CRITICAL ERROR: Bootstrap failed. Please provide a working set of requirements.")
     
+    # In agent_logic.py
+
     def _run_bootstrap_and_validate(self, venv_dir, requirements_source):
         python_executable = str((venv_dir / "bin" / "python").resolve())
-        
-        if isinstance(requirements_source, (Path, str)):
-            pip_command = [python_executable, "-m", "pip", "install", "-r", str(requirements_source)]
-        else:
-            temp_reqs_path = venv_dir / "temp_reqs.txt"
-            with open(temp_reqs_path, "w") as f: f.write("\n".join(requirements_source))
-            pip_command = [python_executable, "-m", "pip", "install", "-r", str(temp_reqs_path)]
-            
-        _, stderr_install, returncode = run_command(pip_command)
-        if returncode != 0:
-            return False, None, f"Failed to install dependencies. Error: {stderr_install}"
+        project_dir = self.config.get("VALIDATION_CONFIG", {}).get("project_dir")
+        test_reqs_path = self.config.get("TEST_REQUIREMENTS_FILE")
 
+        # --- START OF DEFINITIVE "TWO-FILE" INSTALL LOGIC ---
+        # STEP 1: Install the core dependencies we are managing.
+        print("--> Bootstrap Step 1: Installing core dependencies...")
+        req_path = str(requirements_source.resolve())
+        pip_command_core = [python_executable, "-m", "pip", "install", "-r", req_path]
+        _, stderr_core, returncode_core = run_command(pip_command_core, cwd=project_dir)
+        if returncode_core != 0:
+            return False, None, f"Failed to install core dependencies. Error: {stderr_core}"
+
+        # STEP 2: Install the static testing toolchain.
+        if test_reqs_path:
+            print("\n--> Bootstrap Step 2: Installing testing toolchain...")
+            pip_command_test = [python_executable, "-m", "pip", "install", "-r", str(Path(test_reqs_path).resolve())]
+            _, stderr_test, returncode_test = run_command(pip_command_test, cwd=project_dir)
+            if returncode_test != 0:
+                return False, None, f"Failed to install test dependencies. Error: {stderr_test}"
+        # --- END OF DEFINITIVE "TWO-FILE" INSTALL LOGIC ---
+
+        print("\n--> Bootstrap Step 3: Running validation suite...")
         success, metrics, validation_output = validate_changes(python_executable, self.config, group_title="Running Validation on New Baseline")
         if not success:
             return False, None, validation_output
             
-        installed_packages, _, _ = run_command([python_executable, "-m", "pip", "freeze"])
-        return True, {"metrics": metrics, "packages": self._prune_pip_freeze(installed_packages)}, None
+        # Freeze the environment to get the final list of CORE packages.
+        # This is a bit tricky; we need to freeze *before* installing test tools.
+        # A better way is to generate the list from what we installed.
+        # For now, we will just return the content of the file we installed.
+        with open(requirements_source, 'r') as f:
+            final_packages = f.read()
 
-   # In agent_logic.py
+        return True, {"metrics": metrics, "packages": final_packages}, None
 
     def run(self):
         if os.path.exists(self.config["METRICS_OUTPUT_FILE"]):
@@ -307,29 +323,20 @@ class DependencyAgent:
             return max(stable_versions, key=parse_version) if stable_versions else max([p.version for p in package_info.packages if p.version], key=parse_version)
         except Exception: return None
 
+    # In agent_logic.py
+
     def _try_install_and_validate(self, package_to_update, new_version, dynamic_constraints, baseline_reqs_path, is_probe):
-        start_group(f"Probe: Attempting install & validation for {package_to_update}=={new_version}")
+        start_group(f"Probe: Install & Validate for {package_to_update}=={new_version}")
         
         venv_dir = Path("./temp_venv")
         if venv_dir.exists(): shutil.rmtree(venv_dir)
         venv.create(venv_dir, with_pip=True)
         python_executable = str((venv_dir / "bin" / "python").resolve())
-        
-        old_version = "N/A"
-        with open(baseline_reqs_path, "r") as f:
-            for line in f:
-                if self._get_package_name_from_spec(line.split(';')[0]) == package_to_update and '==' in line:
-                    old_version = line.split(';')[0].strip().split('==')[1]
-                    break
-        
-        if new_version == old_version:
-            print(f"--> Version is unchanged ({old_version}). Skipping probe.")
-            end_group()
-            return True, "Validation skipped (no change)", ""
+        project_dir = self.config.get("VALIDATION_CONFIG", {}).get("project_dir")
+        test_reqs_path = self.config.get("TEST_REQUIREMENTS_FILE")
 
-        print(f"--> Preparing test environment: Updating '{package_to_update}' from {old_version} to {new_version}")
-
-        # --- START OF CRITICAL CHANGE: Pass requirements directly to command line ---
+        # --- Stage 1: Install the proposed CORE dependency set ---
+        print("--> Stage 1: Installing the proposed core dependency set...")
         requirements_list = []
         with open(baseline_reqs_path, "r") as f:
             for line in f:
@@ -341,47 +348,30 @@ class DependencyAgent:
                 else:
                     requirements_list.append(line)
         
-        # This command is now much cleaner and will produce better error messages
-        pip_command = [python_executable, "-m", "pip", "install"] + requirements_list
-        # --- END OF CRITICAL CHANGE ---
+        pip_command_core = [python_executable, "-m", "pip", "install"] + requirements_list
+        _, stderr_install, returncode_core = run_command(pip_command_core, cwd=project_dir)
+        if returncode_core != 0:
+            summary = self._get_error_summary(stderr_install)
+            end_group(); return False, f"Core dependency installation failed: {summary}", stderr_install
 
-        _, stderr_install, returncode = run_command(pip_command)
-        
-        if returncode != 0:
-            print("--> ERROR: Installation failed. Analyzing conflict...")
-            # The error from pip is now directly readable, so we can use a simpler regex
-            conflict_match = re.search(r"because these package versions have conflicting dependencies.\s*([\s\S]*)The conflict is caused by:", stderr_install, re.MULTILINE)
-            reason = "Installation conflict"
-            if conflict_match:
-                try:
-                    conflict_lines = conflict_match.group(1).strip().split('\n')
-                    packages_involved = [line.split(' ')[0].strip() for line in conflict_lines if line.strip()]
-                    reason = f"Conflict involves: {', '.join(packages_involved)}"
-                except Exception:
-                    reason = "Conflict (Could not parse details)"
-            else: # Fallback for other error types
-                 summary = self._get_error_summary(stderr_install)
-                 reason = f"Installation failed: {summary}"
+        # --- Stage 2: Install the static testing toolchain ---
+        if test_reqs_path:
+            print("\n--> Stage 2: Installing testing toolchain...")
+            pip_command_test = [python_executable, "-m", "pip", "install", "-r", str(Path(test_reqs_path).resolve())]
+            _, stderr_test, returncode_test = run_command(pip_command_test, cwd=project_dir)
+            if returncode_test != 0:
+                 summary = self._get_error_summary(stderr_test)
+                 end_group(); return False, f"Test dependency installation failed: {summary}", stderr_test
 
-            print(f"--> DIAGNOSIS: {reason}")
-            end_group()
-            return False, reason, stderr_install
-        
-        print("--> Installation successful. Running validation suite...")
-        success, metrics, validation_output = validate_changes(python_executable, self.config, group_title=f"Running Validation on {package_to_update}=={new_version}")
-
+        # --- Stage 3: Run Validation ---
+        print("\n--> Stage 3: Running validation suite...")
+        success, metrics, validation_output = validate_changes(python_executable, self.config, group_title=f"Running Validation")
         if not success:
-            print("--> ERROR: Validation script failed.")
-            end_group()
-            return False, "Validation script failed", validation_output
+            end_group(); return False, "Validation script failed", validation_output
 
-        print("--> SUCCESS: Installation and validation passed.")
+        print("--> SUCCESS: Installation and validation passed for this probe.")
         end_group()
         return True, metrics, ""
-
-    # In agent_logic.py
-
-    # In agent_logic.py
 
     def attempt_update_with_healing(self, package, current_version, target_version, dynamic_constraints, baseline_reqs_path):
         """
