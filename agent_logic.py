@@ -139,55 +139,48 @@ class DependencyAgent:
         installed_packages, _, _ = run_command([python_executable, "-m", "pip", "freeze"])
         return True, {"metrics": metrics, "packages": self._prune_pip_freeze(installed_packages)}, None
 
-   # In agent_logic.py
+    # In agent_logic.py
 
     def run(self):
         if os.path.exists(self.config["METRICS_OUTPUT_FILE"]):
             os.remove(self.config["METRICS_OUTPUT_FILE"])
         
-        # --- START OF THE FINAL "UNPIN AND BOOTSTRAP" ARCHITECTURE ---
-        print("INFO: Performing Initial Baseline Health Check...")
-        start_group("Initial Baseline Health Check")
-        
-        venv_dir = Path("./initial_check_venv")
-        if venv_dir.exists(): shutil.rmtree(venv_dir)
-        venv.create(venv_dir, with_pip=True)
-        
-        success, _, error_log = self._run_bootstrap_and_validate(venv_dir, self.requirements_path)
-        end_group()
-        
-        if not success:
-            print("WARNING: Initial baseline is broken. Activating 'Unpin and Bootstrap' repair strategy.", file=sys.stderr)
-            start_group("REPAIR MODE: Re-bootstrapping from unpinned requirements")
+        is_pinned, _ = self._get_requirements_state()
 
-            # Step 1: Read the broken requirements file and extract only the package names.
-            print("--> Step 1: Extracting package names from broken requirements file...")
-            package_names = []
-            with open(self.requirements_path, 'r') as f_read:
-                for line in f_read:
-                    pkg_name = self._get_package_name_from_spec(line)
-                    if pkg_name:
-                        package_names.append(pkg_name)
-            
-            # Step 2: Overwrite the requirements file with the unpinned list.
-            print(f"--> Step 2: Overwriting '{self.requirements_path.name}' with {len(package_names)} unpinned packages.")
-            with open(self.requirements_path, 'w') as f_write:
-                f_write.write("\n".join(sorted(package_names)))
-
-            # Step 3: Call the standard bootstrap method. It will now operate on the unpinned file.
-            print("\n--> Step 3: Calling bootstrap to find a new, stable, pinned baseline...")
-            # This will create a new venv, let pip resolve the unpinned list, validate it,
-            # and overwrite the requirements file with the new pinned versions.
+        # --- START OF THE FINAL, CORRECT ARCHITECTURE ---
+        if not is_pinned:
+            # If the requirements are unpinned, the bootstrap process is our initial health check.
+            print("INFO: Unpinned requirements detected. Bootstrapping a new baseline...")
             self._bootstrap_unpinned_requirements()
-            
-            # After this, self.requirements_path will contain a new, provably working baseline.
-            print("\nINFO: Baseline successfully repaired. Proceeding to normal update pass.")
-            end_group()
         else:
-            print("Initial baseline is valid and stable.")
+            # If requirements are already pinned, we still run a full validation and regeneration.
+            # This ensures the file is clean and the environment is truly working.
+            print("INFO: Found pinned requirements. Running initial health check and regenerating lockfile...")
+            start_group("Initial Baseline Health Check")
+            
+            venv_dir = Path("./initial_check_venv")
+            if venv_dir.exists(): shutil.rmtree(venv_dir)
+            venv.create(venv_dir, with_pip=True)
+            
+            # Use the universal bootstrap function to install, test, and freeze the environment.
+            success, result, error_log = self._run_bootstrap_and_validate(venv_dir, self.requirements_path)
+            
+            if not success:
+                # If the pinned requirements are broken, we activate the "Unpin and Bootstrap" repair.
+                print("WARNING: Initial baseline is broken. Activating 'Unpin and Bootstrap' repair strategy.", file=sys.stderr)
+                end_group() # End the health check group
+                self._unpin_and_bootstrap()
+            else:
+                # If the pinned requirements were valid, we overwrite the file with the clean, frozen state.
+                # This sanitizes the file and ensures it's in the perfect state for the agent.
+                print("Initial baseline is valid and stable. Overwriting requirements file with clean, frozen state.")
+                with open(self.requirements_path, "w") as f:
+                    f.write(result["packages"])
+                end_group()
         # --- END OF THE FINAL ARCHITECTURE ---
 
-        # The rest of the update pass logic remains the same.
+        # At this point, we are GUARANTEED to have a valid, fully-pinned baseline to work from.
+        
         final_successful_updates, final_failed_updates = {}, {}
         pass_num = 0
         
@@ -206,7 +199,7 @@ class DependencyAgent:
             packages_to_update = []
             with open(progressive_baseline_path, 'r') as f: lines = [line.strip() for line in f if line.strip() and not line.strip().startswith('#')]
             for line in lines:
-                if '==' not in line or line.startswith('-e'): continue
+                if '==' not in line or line.strip().startswith('-e'): continue
                 package, current_version = self._get_package_name_from_spec(line.split('==')[0]), line.split('==')[1].split(';')[0]
                 latest_version = self.get_latest_version(package)
                 if latest_version and parse_version(latest_version) > parse_version(current_version):
@@ -217,6 +210,7 @@ class DependencyAgent:
                 if progressive_baseline_path.exists(): progressive_baseline_path.unlink()
                 break 
 
+            # HURM 4.0 Risk Calculation (This part is correct)
             update_plan = []
             for pkg, cur, target in packages_to_update:
                 components = self._calculate_update_risk_components(pkg, cur, target)
@@ -282,7 +276,6 @@ class DependencyAgent:
         if final_successful_updates:
             self._print_final_summary(final_successful_updates, final_failed_updates)
             print("\nRun complete. The final requirements.txt is the latest provably working version.")
-    
 
 
     def _print_final_summary(self, successful, failed):
@@ -643,3 +636,35 @@ class DependencyAgent:
         print("--> SUCCESS: The co-resolution plan is provably working.")
         end_group()
         return True
+    
+    # In agent_logic.py
+
+    def _unpin_and_bootstrap(self):
+        """
+        The definitive repair strategy: takes a broken requirements file,
+        unpins it, and calls the standard bootstrap process to create a new,
+        working lock file from scratch.
+        """
+        start_group("REPAIR MODE: Re-bootstrapping from unpinned requirements")
+        
+        print("--> Step 1: Extracting package names from broken requirements file...")
+        package_names = []
+        with open(self.requirements_path, 'r') as f_read:
+            for line in f_read:
+                # Keep the editable install line as-is, but unpin others.
+                if line.strip().startswith('-e'):
+                    package_names.append(line.strip())
+                else:
+                    pkg_name = self._get_package_name_from_spec(line)
+                    if pkg_name:
+                        package_names.append(pkg_name)
+        
+        print(f"--> Step 2: Overwriting '{self.requirements_path.name}' with unpinned packages.")
+        with open(self.requirements_path, 'w') as f_write:
+            f_write.write("\n".join(sorted(package_names)))
+
+        print("\n--> Step 3: Calling bootstrap to find a new, stable, pinned baseline...")
+        self._bootstrap_unpinned_requirements()
+        
+        print("\nINFO: Baseline successfully repaired.")
+        end_group()
