@@ -118,101 +118,76 @@ class DependencyAgent:
         start_group("View Initial Baseline Failure Log"); print(error_log); end_group()
         sys.exit("CRITICAL ERROR: Bootstrap failed. Please provide a working set of requirements.")
     
-   # In agent_logic.py
-
     def _run_bootstrap_and_validate(self, venv_dir, requirements_source):
         python_executable = str((venv_dir / "bin" / "python").resolve())
-        project_dir = self.config.get("VALIDATION_CONFIG", {}).get("project_dir")
-        test_reqs_path = self.config.get("TEST_REQUIREMENTS_FILE")
-
-        # STEP 1: Install the project from its high-level requirement file (e.g., containing '-e .[socks]').
-        # This resolves and installs the core dependencies.
-        print(f"--> Bootstrap Step 1: Installing project and resolving core dependencies from '{requirements_source.name}'...")
-        req_path = str(requirements_source.resolve())
-        pip_command_main = [python_executable, "-m", "pip", "install", "-r", req_path]
-        _, stderr_main, returncode_main = run_command(pip_command_main, cwd=".")
-        if returncode_main != 0:
-            return False, None, f"Failed to install project from source. Error: {stderr_main}"
-
-        # STEP 2: Freeze the environment to capture ONLY the resolved core dependencies.
-        print("\n--> Bootstrap Step 2: Freezing the resolved dependencies...")
-        core_packages_output, _, _ = run_command([python_executable, "-m", "pip", "freeze"])
-        # Our new prune function will correctly strip the '-e' line.
-        core_packages = self._prune_pip_freeze(core_packages_output)
         
-        # STEP 3: Now, install the static testing toolchain.
-        if test_reqs_path and Path(test_reqs_path).exists():
-            print(f"\n--> Bootstrap Step 3: Installing testing toolchain from '{test_reqs_path}'...")
-            pip_command_test = [python_executable, "-m", "pip", "install", "-r", str(Path(test_reqs_path).resolve())]
-            _, stderr_test, returncode_test = run_command(pip_command_test, cwd=".")
-            if returncode_test != 0:
-                return False, None, f"Failed to install test dependencies. Error: {stderr_test}"
-        
-        # STEP 4: Validate the complete environment.
-        print("\n--> Bootstrap Step 4: Running validation suite...")
+        if isinstance(requirements_source, (Path, str)):
+            pip_command = [python_executable, "-m", "pip", "install", "-r", str(requirements_source)]
+        else:
+            temp_reqs_path = venv_dir / "temp_reqs.txt"
+            with open(temp_reqs_path, "w") as f: f.write("\n".join(requirements_source))
+            pip_command = [python_executable, "-m", "pip", "install", "-r", str(temp_reqs_path)]
+            
+        _, stderr_install, returncode = run_command(pip_command)
+        if returncode != 0:
+            return False, None, f"Failed to install dependencies. Error: {stderr_install}"
+
         success, metrics, validation_output = validate_changes(python_executable, self.config, group_title="Running Validation on New Baseline")
         if not success:
             return False, None, validation_output
             
-        # If everything passes, we return the CLEAN, CORE-ONLY packages.
-        return True, {"metrics": metrics, "packages": core_packages}, None
+        installed_packages, _, _ = run_command([python_executable, "-m", "pip", "freeze"])
+        return True, {"metrics": metrics, "packages": self._prune_pip_freeze(installed_packages)}, None
 
-    # In agent_logic.py
+   # In agent_logic.py
 
     def run(self):
         if os.path.exists(self.config["METRICS_OUTPUT_FILE"]):
             os.remove(self.config["METRICS_OUTPUT_FILE"])
         
-        is_pinned, _ = self._get_requirements_state()
-
-        if not is_pinned:
-            # If the requirements are unpinned, the bootstrap process is our initial health check.
-            print("INFO: Unpinned requirements detected. Bootstrapping a new baseline...")
-            self._bootstrap_unpinned_requirements()
-        else:
-            # --- START OF THE CORRECT, SIMPLE HEALTH CHECK ---
-            print("INFO: Found pinned requirements. Running initial health check...")
-            start_group("Initial Baseline Health Check")
-            
-            venv_dir = Path("./initial_check_venv")
-            if venv_dir.exists(): shutil.rmtree(venv_dir)
-            venv.create(venv_dir, with_pip=True)
-            python_executable = str((venv_dir / "bin" / "python").resolve())
-            
-            # This is a direct validation of the existing pinned file, using our robust two-step install.
-            req_path = str(self.requirements_path.resolve())
-            test_reqs_path_str = self.config.get("TEST_REQUIREMENTS_FILE")
-            
-            # Step 1: Install main requirements
-            pip_command_main = [python_executable, "-m", "pip", "install", "-r", req_path]
-            _, stderr_main, returncode_main = run_command(pip_command_main, cwd=".")
-            
-            # Step 2: Install test requirements
-            if returncode_main == 0 and test_reqs_path_str and Path(test_reqs_path_str).exists():
-                pip_command_test = [python_executable, "-m", "pip", "install", "-r", str(Path(test_reqs_path_str).resolve())]
-                _, stderr_test, returncode_test = run_command(pip_command_test, cwd=".")
-                if returncode_test != 0:
-                    returncode_main = returncode_test # Propagate failure
-                    stderr_main += "\n" + stderr_test
-            
-            if returncode_main != 0:
-                print("WARNING: Initial baseline is broken (installation failed). Activating repair mode.", file=sys.stderr)
-                end_group()
-                self._unpin_and_bootstrap() # Your simple, elegant repair
-            else:
-                # Step 3: Validate
-                success, _, output = validate_changes(python_executable, self.config)
-                if not success:
-                    print("WARNING: Initial baseline is broken (validation failed). Activating repair mode.", file=sys.stderr)
-                    end_group()
-                    self._unpin_and_bootstrap() # Your simple, elegant repair
-                else:
-                    print("Initial baseline is valid and stable.")
-                    end_group()
-            # --- END OF THE CORRECT, SIMPLE HEALTH CHECK ---
-
-        # At this point, we are GUARANTEED to have a valid, pinned baseline to work from.
+        # --- START OF THE FINAL "UNPIN AND BOOTSTRAP" ARCHITECTURE ---
+        print("INFO: Performing Initial Baseline Health Check...")
+        start_group("Initial Baseline Health Check")
         
+        venv_dir = Path("./initial_check_venv")
+        if venv_dir.exists(): shutil.rmtree(venv_dir)
+        venv.create(venv_dir, with_pip=True)
+        
+        success, _, error_log = self._run_bootstrap_and_validate(venv_dir, self.requirements_path)
+        end_group()
+        
+        if not success:
+            print("WARNING: Initial baseline is broken. Activating 'Unpin and Bootstrap' repair strategy.", file=sys.stderr)
+            start_group("REPAIR MODE: Re-bootstrapping from unpinned requirements")
+
+            # Step 1: Read the broken requirements file and extract only the package names.
+            print("--> Step 1: Extracting package names from broken requirements file...")
+            package_names = []
+            with open(self.requirements_path, 'r') as f_read:
+                for line in f_read:
+                    pkg_name = self._get_package_name_from_spec(line)
+                    if pkg_name:
+                        package_names.append(pkg_name)
+            
+            # Step 2: Overwrite the requirements file with the unpinned list.
+            print(f"--> Step 2: Overwriting '{self.requirements_path.name}' with {len(package_names)} unpinned packages.")
+            with open(self.requirements_path, 'w') as f_write:
+                f_write.write("\n".join(sorted(package_names)))
+
+            # Step 3: Call the standard bootstrap method. It will now operate on the unpinned file.
+            print("\n--> Step 3: Calling bootstrap to find a new, stable, pinned baseline...")
+            # This will create a new venv, let pip resolve the unpinned list, validate it,
+            # and overwrite the requirements file with the new pinned versions.
+            self._bootstrap_unpinned_requirements()
+            
+            # After this, self.requirements_path will contain a new, provably working baseline.
+            print("\nINFO: Baseline successfully repaired. Proceeding to normal update pass.")
+            end_group()
+        else:
+            print("Initial baseline is valid and stable.")
+        # --- END OF THE FINAL ARCHITECTURE ---
+
+        # The rest of the update pass logic remains the same.
         final_successful_updates, final_failed_updates = {}, {}
         pass_num = 0
         
@@ -309,6 +284,7 @@ class DependencyAgent:
             print("\nRun complete. The final requirements.txt is the latest provably working version.")
     
 
+
     def _print_final_summary(self, successful, failed):
         print("\n" + "#"*70); print("### OVERALL UPDATE RUN SUMMARY ###")
         if successful:
@@ -331,66 +307,81 @@ class DependencyAgent:
             return max(stable_versions, key=parse_version) if stable_versions else max([p.version for p in package_info.packages if p.version], key=parse_version)
         except Exception: return None
 
-    # In agent_logic.py
-
     def _try_install_and_validate(self, package_to_update, new_version, dynamic_constraints, baseline_reqs_path, is_probe):
-        start_group(f"Probe: Install & Validate for {package_to_update}=={new_version}")
+        start_group(f"Probe: Attempting install & validation for {package_to_update}=={new_version}")
         
         venv_dir = Path("./temp_venv")
         if venv_dir.exists(): shutil.rmtree(venv_dir)
         venv.create(venv_dir, with_pip=True)
         python_executable = str((venv_dir / "bin" / "python").resolve())
-        project_dir = self.config.get("VALIDATION_CONFIG", {}).get("project_dir")
-        test_reqs_path_str = self.config.get("TEST_REQUIREMENTS_FILE")
         
-        CWD = "."
+        old_version = "N/A"
+        with open(baseline_reqs_path, "r") as f:
+            for line in f:
+                if self._get_package_name_from_spec(line.split(';')[0]) == package_to_update and '==' in line:
+                    old_version = line.split(';')[0].strip().split('==')[1]
+                    break
+        
+        if new_version == old_version:
+            print(f"--> Version is unchanged ({old_version}). Skipping probe.")
+            end_group()
+            return True, "Validation skipped (no change)", ""
 
-        # --- Stage 1: Install the proposed CORE dependency set ---
-        print("--> Probe Step 1: Installing the proposed core dependency set...")
-        # Create a temporary requirements file for the probe
-        temp_core_reqs_path = venv_dir / "probe_core_reqs.txt"
-        with open(baseline_reqs_path, "r") as f_read, open(temp_core_reqs_path, "w") as f_write:
-             # This loop now reads the file of core, pinned dependencies.
-             for line in f_read:
+        print(f"--> Preparing test environment: Updating '{package_to_update}' from {old_version} to {new_version}")
+
+        # --- START OF CRITICAL CHANGE: Pass requirements directly to command line ---
+        requirements_list = []
+        with open(baseline_reqs_path, "r") as f:
+            for line in f:
                 line = line.strip()
                 if not line or line.startswith('#'): continue
-                if self._get_package_name_from_spec(line) == package_to_update:
-                    f_write.write(f"{package_to_update}=={new_version}\n")
+                if self._get_package_name_from_spec(line.split(';')[0]) == package_to_update:
+                    marker_part = f" ;{line.split(';')[1]}" if ';' in line else ""
+                    requirements_list.append(f"{package_to_update}=={new_version}{marker_part}")
                 else:
-                    f_write.write(f"{line}\n")
+                    requirements_list.append(line)
+        
+        # This command is now much cleaner and will produce better error messages
+        pip_command = [python_executable, "-m", "pip", "install"] + requirements_list
+        # --- END OF CRITICAL CHANGE ---
 
-        pip_command_core = [python_executable, "-m", "pip", "install", "-r", str(temp_core_reqs_path.resolve())]
-        _, stderr_core, returncode_core = run_command(pip_command_core, cwd=CWD)
-        if returncode_core != 0:
-            summary = self._get_error_summary(stderr_core)
-            end_group(); return False, f"Core dependency installation failed: {summary}", stderr_core
+        _, stderr_install, returncode = run_command(pip_command)
+        
+        if returncode != 0:
+            print("--> ERROR: Installation failed. Analyzing conflict...")
+            # The error from pip is now directly readable, so we can use a simpler regex
+            conflict_match = re.search(r"because these package versions have conflicting dependencies.\s*([\s\S]*)The conflict is caused by:", stderr_install, re.MULTILINE)
+            reason = "Installation conflict"
+            if conflict_match:
+                try:
+                    conflict_lines = conflict_match.group(1).strip().split('\n')
+                    packages_involved = [line.split(' ')[0].strip() for line in conflict_lines if line.strip()]
+                    reason = f"Conflict involves: {', '.join(packages_involved)}"
+                except Exception:
+                    reason = "Conflict (Could not parse details)"
+            else: # Fallback for other error types
+                 summary = self._get_error_summary(stderr_install)
+                 reason = f"Installation failed: {summary}"
 
-        # --- Stage 2: Install the project itself ---
-        print(f"\n--> Probe Step 2: Installing project '{project_dir}'...")
-        pip_command_project = [python_executable, "-m", "pip", "install", f"-e ./{project_dir}[socks]"]
-        _, stderr_project, returncode_project = run_command(pip_command_project, cwd=CWD)
-        if returncode_project != 0:
-            summary = self._get_error_summary(stderr_project)
-            end_group(); return False, f"Project installation failed: {summary}", stderr_project
+            print(f"--> DIAGNOSIS: {reason}")
+            end_group()
+            return False, reason, stderr_install
+        
+        print("--> Installation successful. Running validation suite...")
+        success, metrics, validation_output = validate_changes(python_executable, self.config, group_title=f"Running Validation on {package_to_update}=={new_version}")
 
-        # --- Stage 3: Install the static testing toolchain ---
-        if test_reqs_path_str and Path(test_reqs_path_str).exists():
-            print(f"\n--> Probe Step 3: Installing testing toolchain from '{test_reqs_path_str}'...")
-            pip_command_test = [python_executable, "-m", "pip", "install", "-r", str(Path(test_reqs_path_str).resolve())]
-            _, stderr_test, returncode_test = run_command(pip_command_test, cwd=CWD)
-            if returncode_test != 0:
-                 summary = self._get_error_summary(stderr_test)
-                 end_group(); return False, f"Test dependency installation failed: {summary}", stderr_test
-
-        # --- Stage 4: Run Validation ---
-        print("\n--> Probe Step 4: Running validation suite...")
-        success, metrics, validation_output = validate_changes(python_executable, self.config, group_title=f"Running Validation")
         if not success:
-            end_group(); return False, "Validation script failed", validation_output
+            print("--> ERROR: Validation script failed.")
+            end_group()
+            return False, "Validation script failed", validation_output
 
-        print("--> SUCCESS: Probe passed.")
+        print("--> SUCCESS: Installation and validation passed.")
         end_group()
         return True, metrics, ""
+
+    # In agent_logic.py
+
+    # In agent_logic.py
 
     def attempt_update_with_healing(self, package, current_version, target_version, dynamic_constraints, baseline_reqs_path):
         """
@@ -554,32 +545,10 @@ class DependencyAgent:
             return sorted(candidate_versions, key=parse_version)
         except Exception: return []
 
-
-    # In agent_logic.py
-
     def _prune_pip_freeze(self, freeze_output):
-        """
-        Cleans the output of 'pip freeze' to create a clean, complete lock file.
-        It now correctly PRESERVES both standard pinned dependencies ('==') and
-        the essential editable install line ('-e').
-        """
         lines = freeze_output.strip().split('\n')
-        
-        # --- THE DEFINITIVE, FINAL FIX ---
-        # A line is kept if it is a standard pin ('==') OR if it's an editable install ('-e').
-        # This is the crucial logic that preserves the project's own installation instruction.
-        pruned_lines = [
-            line for line in lines 
-            if '==' in line or line.strip().startswith('-e')
-        ]
-        # --- END OF THE DEFINITIVE FIX ---
-        
-        # Sort the output for consistency, keeping editable installs at the top.
-        editable_lines = sorted([line for line in pruned_lines if line.startswith('-e')])
-        pinned_lines = sorted([line for line in pruned_lines if '==' in line])
+        return "\n".join([line for line in lines if '==' in line and not line.startswith('-e')])
 
-        return "\n".join(editable_lines + pinned_lines)
-    
     def _get_error_summary(self, error_message: str) -> str:
         """Delegates the task of summarizing an error to the Expert Agent."""
         return self.expert.summarize_error(error_message)
@@ -674,38 +643,3 @@ class DependencyAgent:
         print("--> SUCCESS: The co-resolution plan is provably working.")
         end_group()
         return True
-    
-    # In agent_logic.py
-
-    def _unpin_and_bootstrap(self):
-        """
-        The definitive repair strategy: takes a broken requirements file,
-        unpins it, and calls the standard bootstrap process to create a new,
-        working lock file from scratch.
-        """
-        start_group("REPAIR MODE: Re-bootstrapping from unpinned requirements")
-        
-        # Step 1: Read the broken file and extract only the package names.
-        print("--> Step 1: Extracting package names from broken requirements file...")
-        package_names = []
-        with open(self.requirements_path, 'r') as f_read:
-            for line in f_read:
-                # Keep the editable install line as-is, but unpin others.
-                if line.strip().startswith('-e'):
-                    package_names.append(line.strip())
-                else:
-                    pkg_name = self._get_package_name_from_spec(line)
-                    if pkg_name:
-                        package_names.append(pkg_name)
-        
-        # Step 2: Overwrite the requirements file with the unpinned list.
-        print(f"--> Step 2: Overwriting '{self.requirements_path.name}' with unpinned packages.")
-        with open(self.requirements_path, 'w') as f_write:
-            f_write.write("\n".join(sorted(package_names)))
-
-        # Step 3: Call the standard bootstrap method. It will now operate on the unpinned file.
-        print("\n--> Step 3: Calling bootstrap to find a new, stable, pinned baseline...")
-        self._bootstrap_unpinned_requirements()
-        
-        print("\nINFO: Baseline successfully repaired.")
-        end_group()
