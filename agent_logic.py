@@ -539,8 +539,26 @@ class DependencyAgent:
         except Exception: return []
 
     def _prune_pip_freeze(self, freeze_output):
+        """
+        Cleans the output of 'pip freeze' to create a clean, complete lock file.
+        It now correctly PRESERVES both standard pinned dependencies ('==') and
+        the essential editable install line ('-e').
+        """
         lines = freeze_output.strip().split('\n')
-        return "\n".join([line for line in lines if '==' in line and not line.startswith('-e')])
+        
+        # --- THE DEFINITIVE, FINAL FIX ---
+        # A line is kept if it is a standard pin ('==') OR if it's an editable install ('-e').
+        pruned_lines = [
+            line for line in lines 
+            if '==' in line or line.strip().startswith('-e')
+        ]
+        # --- END OF THE DEFINITIVE FIX ---
+        
+        # Sort the output for consistency, keeping editable installs at the top.
+        editable_lines = sorted([line for line in pruned_lines if line.startswith('-e')])
+        pinned_lines = sorted([line for line in pruned_lines if '==' in line])
+
+        return "\n".join(editable_lines + pinned_lines)
 
     def _get_error_summary(self, error_message: str) -> str:
         """Delegates the task of summarizing an error to the Expert Agent."""
