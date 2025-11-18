@@ -14,7 +14,7 @@ AGENT_CONFIG = {
         "type": "smoke_test_with_pytest_report",
         "smoke_test_script": "validation_smoke_requests.py",
         "pytest_target": "tests",
-        "project_dir": "requests" 
+        "project_dir": "requests_repo" 
     },
     
     # 3. All other standard settings
