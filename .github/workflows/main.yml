@@ -48,6 +48,7 @@ jobs:
         run: python dependency_agent.py
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          PROJECT_ID: requests  # Set your project ID here
 
       # --- ADD THIS NEW STEP ---
       - name: Configure git to ignore temporary directories
@@ -66,17 +67,26 @@ jobs:
           git config --global user.name 'AURA Dependency Agent'
           git config --global user.email 'aura-agent@users.noreply.github.com'
           
-          TARGET_FILE="requirements-dev.txt"
+          # --- THE DEFINITIVE FIX ---
+          # The agent's config tells us the true path to the file.
+          # We will read it from there instead of hardcoding it.
+          # This requires `jq`, which should be installed.
+          TARGET_FILE_PATH=$(jq -r '.REQUIREMENTS_FILE' "configs/${PROJECT_ID}.json")
           
-          # First, ensure the git index is up-to-date with what's on disk.
-          git add $TARGET_FILE
+          echo "Checking for changes in '$TARGET_FILE_PATH'..."
           
-          # Now, compare the staged changes (what's on disk) with the latest commit.
-          # If there are no staged changes, this command will be quiet.
-          if git diff-index --quiet HEAD; then
-            echo "No dependency changes to commit."
+          # Add a cleanup step for agent-generated folders to prevent git issues
+          rm -rf temp_venv final_venv bootstrap_venv temp_pip_check initial_check_venv
+          
+          # Stage the specific file we care about.
+          git add "$TARGET_FILE_PATH"
+          
+          # Check if there are staged changes for this specific file.
+          if git diff --staged --quiet "$TARGET_FILE_PATH"; then
+            echo "No dependency changes detected in '$TARGET_FILE_PATH'."
             exit 0
           fi
+          # --- END OF FIX ---
           
           echo "Dependencies have changed. Committing and pushing..."
           
