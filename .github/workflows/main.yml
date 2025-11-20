@@ -9,18 +9,16 @@ jobs:
   update-dependencies:
     runs-on: ubuntu-latest
     
-    env:
-      PROJECT_ID: "requests" 
-      
     defaults:
       run:
         working-directory: ${{ github.workspace }}
 
     steps:
-      - name: Checkout Experiment Repository
+      - name: Checkout Agent Repository
         uses: actions/checkout@v4
 
-      - name: Clone Requests Repository
+      - name: Clone Target Repository
+        # We clone into 'requests_repo' to avoid the Python import shadowing bug.
         run: git clone https://github.com/psf/requests.git requests_repo
 
       - name: Set up Python 3.11
@@ -28,68 +26,49 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Cache pip packages
-        uses: actions/cache@v3
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('requirements-dev.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-
-      - name: Install Agent Dependencies and Tools
+      - name: Install Agent Dependencies and All Tools
         run: |
-          # We now install all tools the agent might need, including pip-tools for the repair mode.
-          # We also pin pip-tools to a known stable version.
           python -m pip install \
             google-generativeai \
             pypi-simple \
             packaging \
-            "pip-tools==6.13.0" \
-            "toml"
+            "pip-tools==6.13.0"
+
+      - name: Cache pip packages for the Target
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pip
+          # The key is based on the unpinned "recipe" file.
+          key: ${{ runner.os }}-pip-requests-${{ hashFiles('requirements-dev.txt') }}
 
       - name: Run the Autonomous Agent
         run: python dependency_agent.py
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          PROJECT_ID: requests  # Set your project ID here
-
-      # --- ADD THIS NEW STEP ---
-      - name: Configure git to ignore temporary directories
-        run: |
-          echo "Configuring git to ignore agent artifacts for this run..."
-          # Create a git exclude file for this run
-          echo "/temp_venv/" >> .git/info/exclude
-          echo "/final_venv/" >> .git/info/exclude
-          echo "/bootstrap_venv/" >> .git/info/exclude
-          echo "/temp_pip_check/" >> .git/info/exclude
-          echo "/requests/" >> .git/info/exclude
-      # --- END OF NEW STEP ---
       
       - name: Commit and push changes if any
         run: |
           git config --global user.name 'AURA Dependency Agent'
           git config --global user.email 'aura-agent@users.noreply.github.com'
           
-          # --- THE DEFINITIVE FIX ---
-          # The agent's config tells us the true path to the file.
-          # We will read it from there instead of hardcoding it.
-          # This requires `jq`, which should be installed.
-          TARGET_FILE_PATH=$(jq -r '.REQUIREMENTS_FILE' "configs/${PROJECT_ID}.json")
+          # --- THE DEFINITIVE, SIMPLE FIX ---
+          # We hardcode the correct, known path to the file our agent manages.
+          TARGET_FILE="requirements-dev.txt"
+          # --- END OF FIX ---
           
-          echo "Checking for changes in '$TARGET_FILE_PATH'..."
+          echo "Checking for changes in '$TARGET_FILE'..."
           
-          # Add a cleanup step for agent-generated folders to prevent git issues
-          rm -rf temp_venv final_venv bootstrap_venv temp_pip_check initial_check_venv
+          # Clean up all possible temporary directories before checking git status.
+          rm -rf temp_venv final_venv bootstrap_venv temp_pip_check initial_check_venv repair_check_venv
           
-          # Stage the specific file we care about.
-          git add "$TARGET_FILE_PATH"
+          # Add the specific file we care about.
+          git add "$TARGET_FILE"
           
-          # Check if there are staged changes for this specific file.
-          if git diff --staged --quiet "$TARGET_FILE_PATH"; then
-            echo "No dependency changes detected in '$TARGET_FILE_PATH'."
+          # Check if the file has changes that are staged for commit.
+          if git diff --staged --quiet; then
+            echo "No dependency changes to commit."
             exit 0
           fi
-          # --- END OF FIX ---
           
           echo "Dependencies have changed. Committing and pushing..."
           
@@ -98,9 +77,6 @@ jobs:
             COMMIT_BODY=$(cat metrics_output.txt)
           fi
           
-          # The file is already added, we just need to commit.
           git commit -m "chore(deps): Autonomously manage requests dependencies [skip ci]" -m "$COMMIT_BODY"
-          
           git push
-
   
