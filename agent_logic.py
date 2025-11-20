@@ -89,11 +89,23 @@ class DependencyAgent:
         with open(primary_path, "r") as f:
             return {self._get_package_name_from_spec(line.strip()) for line in f if line.strip() and not line.startswith('#')}
 
+    # In agent_logic.py
+
     def _get_requirements_state(self):
-        if not self.requirements_path.exists(): sys.exit(f"Error: {self.config['REQUIREMENTS_FILE']} not found.")
+        """
+        Checks if the requirements file is fully pinned. Now correctly handles
+        editable install lines ('-e') as a valid "pinned" state.
+        """
+        if not self.requirements_path.exists():
+            sys.exit(f"Error: {self.config['REQUIREMENTS_FILE']} not found.")
+            
         with open(self.requirements_path, "r") as f:
-            lines = [line.strip() for line in f if line.strip() and not line.startswith('#')]
-        return all('==' in line for line in lines), lines
+            lines = [line.strip() for line in f if line.strip() and not line.strip().startswith('#')]
+        is_fully_pinned = all(
+            '==' in line or line.startswith('-e') 
+            for line in lines
+        )
+        return is_fully_pinned, lines
 
     def _bootstrap_unpinned_requirements(self):
         start_group("BOOTSTRAP: Establishing a Stable Baseline")
