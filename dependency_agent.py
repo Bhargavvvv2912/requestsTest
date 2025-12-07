@@ -28,8 +28,6 @@ AGENT_CONFIG = {
 
 if __name__ == "__main__":
     GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-    if not GEMINI_API_KEY:
-        GEMINI_API_KEY='AIzaSyDbXGtg7X-Acn1nGABx7yHk5cGRtzy_dIY'
     
     genai.configure(api_key=GEMINI_API_KEY)
     llm_client = genai.GenerativeModel('gemini-2.5-flash')
