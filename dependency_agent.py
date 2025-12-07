@@ -8,6 +8,7 @@ from agent_logic import DependencyAgent
 AGENT_CONFIG = {
     # 1. Point to the correct, non-generated requirements file for requests
     "REQUIREMENTS_FILE": "requirements-dev.txt",
+    "IS_INSTALLABLE_PACKAGE": True, 
     
     # 2. Use the simple, robust "script" validation for this baseline
     "VALIDATION_CONFIG": {
