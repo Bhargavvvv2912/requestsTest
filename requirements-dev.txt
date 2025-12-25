@@ -1,4 +1,4 @@
--e git+https://github.com/Bhargavvvv2912/requestsTest@2dcb6d35f3f608e0726deb4aa43ce5f7c5c25f4b#egg=requests
+-e git+https://github.com/Bhargavvvv2912/requestsTest@f5f77d053257987dfa86ef3d119c294866d0c336#egg=requests
 Flask==3.1.2
 Jinja2==3.1.6
 MarkupSafe==3.0.3
@@ -24,7 +24,7 @@ iniconfig==2.3.0
 itsdangerous==2.2.0
 jsonschema-specifications==2025.9.1
 jsonschema==4.25.1
-mistune==3.1.4
+mistune==3.2.0
 packaging==25.0
 pluggy==1.6.0
 pycparser==2.23
