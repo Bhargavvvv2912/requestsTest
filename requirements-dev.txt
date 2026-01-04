@@ -1,4 +1,4 @@
--e git+https://github.com/Bhargavvvv2912/requestsTest@e56ac14f3480ffe53c648e14a6de182135ffba07#egg=requests
+-e git+https://github.com/Bhargavvvv2912/requestsTest@18b59bd90364308a7d3d96c83189b9bbedb0cd3c#egg=requests
 Flask==3.1.2
 Jinja2==3.1.6
 MarkupSafe==3.0.3
