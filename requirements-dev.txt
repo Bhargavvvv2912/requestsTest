@@ -1,11 +1,11 @@
--e git+https://github.com/Bhargavvvv2912/requestsTest@0ae2d856f38235062c6f534f046993a50517451e#egg=requests
+-e git+https://github.com/Bhargavvvv2912/requestsTest@9d28b7d589a5f443fea42bc460a430f2d5327994#egg=requests
 Flask==3.1.2
 Jinja2==3.1.6
 MarkupSafe==3.0.3
 PySocks==1.7.1
 PyYAML==6.0.3
 Pygments==2.19.2
-Werkzeug==3.1.4
+Werkzeug==3.1.5
 attrs==25.4.0
 blinker==1.9.0
 brotlicffi==1.2.0.0
@@ -23,7 +23,7 @@ idna==3.11
 iniconfig==2.3.0
 itsdangerous==2.2.0
 jsonschema-specifications==2025.9.1
-jsonschema==4.25.1
+jsonschema==4.26.0
 mistune==3.2.0
 packaging==25.0
 pluggy==1.6.0
@@ -36,4 +36,4 @@ rpds-py==0.30.0
 six==1.17.0
 trustme==1.2.1
 typing_extensions==4.15.0
-urllib3==2.6.2
+urllib3==2.6.3
