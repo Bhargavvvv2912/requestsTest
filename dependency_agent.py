@@ -22,7 +22,7 @@ class GeminiClientWrapper:
 
 AGENT_CONFIG = {
     "PROJECT_NAME": "requests",
-    "IS_INSTALLABLE_PACKAGE": False, 
+    "IS_INSTALLABLE_PACKAGE": True, 
     "REQUIREMENTS_FILE": "requirements.txt",
     "METRICS_OUTPUT_FILE": "metrics_output.txt",
     "PRIMARY_REQUIREMENTS_FILE": "primary_requirements.txt",
