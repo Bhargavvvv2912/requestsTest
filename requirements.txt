@@ -1,4 +1,5 @@
-certifi>=2017.4.17
-charset_normalizer>=2,<4
-idna>=2.5,<4
-urllib3>=1.21.1,<3
+-e git+https://github.com/Bhargavvvv2912/requestsTest@6da18b9f12500fba3e0cce71b8ff380aeeb2ba85#egg=requests
+certifi==2026.1.4
+charset-normalizer==3.4.4
+idna==3.11
+urllib3==2.6.3
