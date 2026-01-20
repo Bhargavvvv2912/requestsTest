@@ -57,7 +57,7 @@ jobs:
           # 5. PHASE 1: Smoke Test (Basic Functionality)
           echo "--> PHASE 1: Running Smoke Test (validation_requests.py)..."
           if [ -f "validation_requests.py" ]; then
-             python validation_requests.py
+             python validation_smoke_requests.py
           else
              echo "Warning: validation_requests.py not found. Skipping Phase 1."
           fi
