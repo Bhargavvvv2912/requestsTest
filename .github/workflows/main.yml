@@ -3,80 +3,117 @@ name: Autonomous Dependency Updater for Requests
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 0 */3 * *'
+    - cron: '0 0 */3 * *' # Run every 3 days
 
 jobs:
   update-dependencies:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     
     defaults:
       run:
         working-directory: ${{ github.workspace }}
 
     steps:
-      - name: Checkout Agent Repository
+      - name: Checkout Repository
         uses: actions/checkout@v4
-
-      - name: Clone Target Repository
-        # We clone into 'requests_repo' to avoid the Python import shadowing bug.
-        run: git clone https://github.com/psf/requests.git requests_repo
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Install Agent Dependencies and All Tools
+      - name: Install Agent Dependencies
         run: |
-          python -m pip install \
-            google-generativeai \
-            pypi-simple \
-            packaging \
-            "pip-tools==6.13.0"
+          # Installing the NEW Google Gen AI SDK (v1.0+) to match your wrapper code
+          python -m pip install google-genai google-api-core pypi-simple packaging pip-tools
 
-      - name: Cache pip packages for the Target
-        uses: actions/cache@v3
-        with:
-          path: ~/.cache/pip
-          # The key is based on the unpinned "recipe" file.
-          key: ${{ runner.os }}-pip-requests-${{ hashFiles('requirements-dev.txt') }}
+      # --- START OF BASELINE STEP ---
+      - name: 🧪 Run Pip Baseline (The Control Group)
+        id: pip_baseline
+        continue-on-error: true # We want to see the Agent run even if Pip fails
+        run: |
+          echo "========================================"
+          echo "STARTING PIP BASELINE TEST"
+          echo "========================================"
+          
+          # 1. Create a clean environment
+          python -m venv baseline_env
+          source baseline_env/bin/activate
+          
+          # 2. Install Dependencies (The "Before" State)
+          echo "--> Installing requirements.txt..."
+          pip install --upgrade -r requirements.txt
+          
+          # 3. Install the Project (Critical for 'requests' src layout)
+          echo "--> Installing 'requests' package in editable mode..."
+          pip install -e .
+          
+          # 4. Install Test Runner (Required for Phase 2)
+          echo "--> Installing Pytest..."
+          pip install pytest
+          
+          # 5. PHASE 1: Smoke Test (Basic Functionality)
+          echo "--> PHASE 1: Running Smoke Test (validation_requests.py)..."
+          if [ -f "validation_requests.py" ]; then
+             python validation_requests.py
+          else
+             echo "Warning: validation_requests.py not found. Skipping Phase 1."
+          fi
+          
+          # 6. PHASE 2: Full Test Suite (Deep Verification)
+          echo "--> PHASE 2: Running Full Pytest Suite..."
+          # We target the 'tests' folder, just like the Agent config
+          pytest tests
+          
+          echo "========================================"
+          echo "RESULT: PIP BASELINE FINISHED"
+          echo "========================================"
 
-      - name: Run the Autonomous Agent
-        run: python dependency_agent.py
+      # --- RUN AURA AGENT ---
+      - name: 🤖 Run AURA Agent
+        # -u forces unbuffered output so you see logs immediately
+        run: python -u dependency_agent.py
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+
+      # --- COMPARE RESULTS ---
+      - name: 📊 Compare Results
+        if: always()
+        run: |
+          echo "=== AURA LOCKFILE (FINAL RESULT) ==="
+          if [ -f "requirements.txt" ]; then
+            cat requirements.txt
+          else
+            echo "requirements.txt not found (Agent might have failed)."
+          fi
+
+      - name: Cleanup Agent Artifacts
+        run: |
+          rm -rf temp_venv final_venv bootstrap_venv temp_pip_check initial_check_venv temp_co_res_venv
       
       - name: Commit and push changes if any
         run: |
           git config --global user.name 'AURA Dependency Agent'
           git config --global user.email 'aura-agent@users.noreply.github.com'
           
-          # --- THE DEFINITIVE, SIMPLE FIX ---
-          # We hardcode the correct, known path to the file our agent manages.
-          TARGET_FILE="requirements-dev.txt"
-          # --- END OF FIX ---
+          TARGET_FILE="requirements.txt"
           
-          echo "Checking for changes in '$TARGET_FILE'..."
+          git add $TARGET_FILE
           
-          # Clean up all possible temporary directories before checking git status.
-          rm -rf temp_venv final_venv bootstrap_venv temp_pip_check initial_check_venv repair_check_venv
-          
-          # Add the specific file we care about.
-          git add "$TARGET_FILE"
-          
-          # Check if the file has changes that are staged for commit.
           if git diff --staged --quiet; then
-            echo "No dependency changes to commit."
+            echo "No changes detected. Skipping commit."
             exit 0
           fi
           
           echo "Dependencies have changed. Committing and pushing..."
           
-          COMMIT_BODY="Automated dependency updates for the Requests library."
+          COMMIT_BODY="Automated dependency updates via AURA."
           if [ -f metrics_output.txt ]; then
             COMMIT_BODY=$(cat metrics_output.txt)
           fi
           
-          git commit -m "chore(deps): Autonomously manage requests dependencies [skip ci]" -m "$COMMIT_BODY"
+          git commit -m "chore(deps): Autonomously manage Requests dependencies [skip ci]" -m "$COMMIT_BODY"
+          
           git push
-  
