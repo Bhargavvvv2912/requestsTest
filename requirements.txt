@@ -1,4 +1,4 @@
--e git+https://github.com/Bhargavvvv2912/requestsTest@8a7cc755d166cd511d1372e33d7a5dffdbbad65f#egg=requests
+-e git+https://github.com/Bhargavvvv2912/requestsTest@307f6d83d9f78e6c5866d967ec1b6578ddbaaefb#egg=requests
 certifi==2026.5.20
 charset-normalizer==3.4.7
 idna==3.18
