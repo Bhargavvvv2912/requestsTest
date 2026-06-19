@@ -1,5 +1,5 @@
--e git+https://github.com/Bhargavvvv2912/requestsTest@375cc4378addf8b5e2b516aa7923d40e9a69d253#egg=requests
-certifi==2026.5.20
+-e git+https://github.com/Bhargavvvv2912/requestsTest@1444abe688909c34ef2085549a0b7ee86ec67c2f#egg=requests
+certifi==2026.6.17
 charset-normalizer==3.4.7
 idna==3.18
 urllib3==2.7.0
